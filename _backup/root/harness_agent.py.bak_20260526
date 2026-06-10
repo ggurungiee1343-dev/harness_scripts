@@ -1,0 +1,690 @@
+import os
+import sys
+import shutil
+import asyncio
+import openai
+import unicodedata
+import re
+import fcntl
+from datetime import datetime
+import importlib
+
+# Telegram imports
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+
+_module_cache = {}
+def _load_module(name: str):
+    if name not in _module_cache:
+        _module_cache[name] = importlib.import_module(name)
+    return _module_cache[name]
+
+# 1. 설정 및 경로 로드
+import config
+sys.path.insert(0, str(config.SCRIPTS_DIR))   # modules/ 하위 폴더 접근
+sys.path.insert(0, str(config.MACBOT_DIR))    # MacBot/ 명시적 경로 추가 (P1 Fix)
+
+# 2. 싱글톤 보장 (중복 실행 방지)
+def ensure_singleton():
+    lock_file = "/tmp/harness_agent.lock"
+    my_pid = os.getpid()
+    os.system(f"ps -ef | grep 'harness_agent.py' | grep -v grep | grep -v {my_pid} | awk '{{print $2}}' | xargs kill -9 > /dev/null 2>&1")
+    
+    global fp
+    fp = open(lock_file, 'w')
+    try:
+        fcntl.lockf(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fp.write(str(my_pid))
+        fp.flush()
+    except (IOError, OSError):
+        print("⚠️ 이미 하네스 에이전트가 실행 중입니다.")
+        sys.exit(1)
+
+# ensure_singleton()은 __main__ 진입 시에만 호출 (라이브러리 모드에서는 호출 안 함)
+
+# MacBot logic_engine 별도 로드 (try 블록 외부로 분리)
+try:
+    from MacBot import logic_engine as _le_mod
+    logic_engine = _le_mod
+except ImportError as e:
+    logic_engine = None
+    print(f"⚠️ MacBot logic_engine 로드 실패: {e}")
+
+# 3. 전문 모듈 로드 (True Lazy Loading)
+class LazyService:
+    def __init__(self, module_name, class_name, *args, **kwargs):
+        self._module_name = module_name
+        self._class_name = class_name
+        self._args = args
+        self._kwargs = kwargs
+        self._instance = None
+
+    def __getattr__(self, name):
+        if self._instance is None:
+            import importlib
+            mod = importlib.import_module(f"modules.{self._module_name}")
+            cls = getattr(mod, self._class_name)
+            self._instance = cls(*self._args, **self._kwargs)
+            print(f"🚀 [LazyLoad] {self._class_name} 인스턴스화 됨")
+        return getattr(self._instance, name)
+
+# 4. 서비스 인스턴스 초기화 (Proxy 객체들)
+wiki = LazyService("wiki_manager", "WikiManager", str(config.WORK_SPACE))
+history = LazyService("history_manager", "HistoryManager", str(config.SCRIPTS_DIR / "harness_memory.json"))
+file_m = LazyService("file_manager", "FileManager", str(config.WORK_SPACE), bot_author="헤르메스봇1")
+memory = LazyService("bio_memory_engine", "BioMemoryEngine", str(config.WORK_SPACE))
+sys_mon = LazyService("system_monitor", "SystemMonitor", threshold_gb=config.MEM_THRESHOLD_GB)
+news = LazyService("news_engine", "NewsEngine", str(config.WORK_SPACE))
+git = LazyService("git_manager", "GitManager", str(config.GIT_REPO_PATH), config.GIT_REMOTE_NAME)
+cog_engine = LazyService("cognitive_engine", "CognitiveEngine", str(config.WORK_SPACE))
+audit = LazyService("audit_engine", "AuditEngine", str(config.WORK_SPACE))
+scanner = LazyService("model_scanner", "ModelScanner")
+ctx_builder = LazyService("hermes_context_builder", "ContextBuilder", str(config.WORK_SPACE))
+ingest_inst = LazyService("ingest_engine", "IngestEngine", source_dir=str(config.CLIPPINGS_DIR), dest_dir=str(config.WIKI_DEST_DIR), llm_func=None)
+
+# Logic Engine 초기화 (지연 로드)
+logic = None
+if logic_engine:
+    class LogicProxy:
+        def __init__(self):
+            self._logic = None
+        def __getattr__(self, name):
+            if self._logic is None:
+                self._logic = logic_engine.LogicEngine(str(config.WORK_SPACE), {
+                    "file_manager": file_m,
+                    "memory_engine": memory,
+                    "system_monitor": sys_mon,
+                    "news_engine": news,
+                    "ingest_engine": ingest_inst
+                })
+                print(f"🚀 [LazyLoad] LogicEngine 인스턴스화 됨")
+            return getattr(self._logic, name)
+    logic = LogicProxy()
+
+# 세만틱 엔진 지연 로드 (P1 Fix: Fallback 추가)
+semantic_instance = None
+def get_semantic():
+    global semantic_instance
+    if semantic_instance is None:
+        try:
+            from MacBot import semantic_engine as sem_mod
+            semantic_instance = sem_mod.SemanticEngine(str(config.WORK_SPACE))
+        except ImportError:
+            from modules import semantic_engine as sem_mod  # Fallback
+            semantic_instance = sem_mod.SemanticEngine(str(config.WORK_SPACE))
+    return semantic_instance
+
+# 5. 하이브리드 LLM 클라이언트
+nvidia_client = None
+if getattr(config, "NVIDIA_API_KEY", ""):
+    nvidia_client = openai.OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=config.NVIDIA_API_KEY, timeout=60.0)
+local_client = openai.OpenAI(base_url=config.LM_STUDIO_BASE_URL, api_key=config.LM_STUDIO_API_KEY, timeout=300.0)
+
+deepseek_client = None
+if getattr(config, "DEEPSEEK_API_KEY", ""):
+    deepseek_client = openai.OpenAI(base_url="https://api.deepseek.com", api_key=config.DEEPSEEK_API_KEY, timeout=120.0)
+
+# ── 모드 정의 ────────────────────────────────────────────────
+MODE_GEMMA4 = "Gemma4"
+MODE_DEEPSEEK = "DeepSeek"
+MODE_NVIDIA = "NVIDIA 70B"
+ALL_MODES = [MODE_GEMMA4, MODE_DEEPSEEK, MODE_NVIDIA]
+# 폴백 체인 (앞에서 실패 시 다음 것 시도)
+FALLBACK_CHAIN = {
+    MODE_GEMMA4:  [MODE_DEEPSEEK, MODE_NVIDIA],
+    MODE_DEEPSEEK: [MODE_NVIDIA, MODE_GEMMA4],
+    MODE_NVIDIA:   [MODE_DEEPSEEK, MODE_GEMMA4],
+}
+
+# ── 모드 라벨 (표시용) ───────────────────────────────────────
+MODE_LABELS = {
+    MODE_GEMMA4:  "🟢 Gemma4 (로컬)",
+    MODE_DEEPSEEK: "🔵 DeepSeek (API)",
+    MODE_NVIDIA:   "🟣 NVIDIA NIM 70B",
+}
+
+# LLM 모드 상태 (파일 기반으로 hermes_local과 상태 공유)
+MODE_FILE = "/Users/bluesea/.hermes/llm_mode.txt"
+FALLBACK_FILE = "/Users/bluesea/.hermes/llm_fallback.txt"
+
+def get_current_mode():
+    if os.path.exists(MODE_FILE):
+        val = open(MODE_FILE).read().strip()
+        # 이전 "NIM/Local" 값 마이그레이션
+        if val == "NIM/Local":
+            return MODE_GEMMA4
+        return val if val in ALL_MODES else MODE_GEMMA4
+    return MODE_GEMMA4
+
+def set_mode(mode: str):
+    """모드 설정 + 자동 폴백 상태 초기화"""
+    if mode not in ALL_MODES:
+        mode = MODE_GEMMA4
+    with open(MODE_FILE, "w") as f:
+        f.write(mode)
+    clear_auto_fallback()
+    return mode
+
+def is_auto_fallback():
+    return os.path.exists(FALLBACK_FILE)
+
+def set_auto_fallback(reason: str = ""):
+    """자동 폴백 상태 설정 (모드 파일은 건드리지 않음 — fallback에서만 읽음)"""
+    with open(FALLBACK_FILE, "w") as f:
+        f.write(reason)
+
+def clear_auto_fallback():
+    if os.path.exists(FALLBACK_FILE):
+        os.remove(FALLBACK_FILE)
+
+# [v3.7] IngestEngine에 LLM 래퍼 연결 (지능형 파일 분류 활성화)
+async def ingest_llm_wrapper(prompt):
+    messages = [{"role": "user", "content": prompt}]
+    ans, _ = await get_llm_response(messages)
+    return ans
+
+if ingest_inst:
+    ingest_inst.llm_func = ingest_llm_wrapper
+
+# --- [Hybrid Router 통합 (Action Realization Layer)] ---
+from hybrid_router import HybridRouter
+
+# 자동 폴백 알림용 봇 참조 (handle_message에서 주입)
+_fallback_notify_bot = None
+_fallback_notify_chat_id = None
+
+# ── 개별 엔진 호출 함수 ────────────────────────────────────────
+async def _call_nvidia(messages):
+    """NVIDIA NIM 70B 직접 호출"""
+    loop = asyncio.get_running_loop()
+    if not nvidia_client:
+        raise Exception("NVIDIA 클라이언트 미초기화")
+    print("🚀 [Engine] NVIDIA NIM (70B) 호출 중...")
+    response = await loop.run_in_executor(None, lambda: nvidia_client.chat.completions.create(
+        model="meta/llama-3.1-70b-instruct", messages=messages, temperature=0.7, max_tokens=2000
+    ))
+    return response.choices[0].message.content, "NVIDIA 70B"
+
+async def _call_local(messages):
+    """LM Studio (Gemma4) 직접 호출"""
+    loop = asyncio.get_running_loop()
+    print("💻 [Engine] LM Studio (Local) 호출 중...")
+    response = await loop.run_in_executor(None, lambda: local_client.chat.completions.create(
+        model="local-model", messages=messages, temperature=0.7, max_tokens=1500
+    ))
+    return response.choices[0].message.content, "LM Studio (Gemma4)"
+
+async def _call_deepseek(messages):
+    """DeepSeek 직접 호출"""
+    loop = asyncio.get_running_loop()
+    if not deepseek_client:
+        raise Exception("DeepSeek 클라이언트 미초기화")
+    print("🚀 [Engine] DeepSeek 호출 중...")
+    response = await loop.run_in_executor(None, lambda: deepseek_client.chat.completions.create(
+        model="deepseek-chat", messages=messages, temperature=0.7, max_tokens=2000
+    ))
+    return response.choices[0].message.content, "DeepSeek"
+
+# ── 프라이머리 + 폴백 체인 ─────────────────────────────────────
+_ENGINE_MAP = {
+    MODE_GEMMA4:  ("Gemma4 (로컬)",  _call_local),
+    MODE_DEEPSEEK: ("DeepSeek (API)", _call_deepseek),
+    MODE_NVIDIA:   ("NVIDIA 70B",    _call_nvidia),
+}
+# 폴백 시도 순서 (언제나 동일: 안정성 높은 순)
+_FALLBACK_ORDER = [("DeepSeek", _call_deepseek), ("NVIDIA 70B", _call_nvidia), ("Gemma4", _call_local)]
+
+async def _call_primary_with_fallback(messages, primary_mode=None):
+    """지정된 프라이머리 모드 호출 → 실패 시 자동 폴백 체인"""
+    if primary_mode is None:
+        primary_mode = get_current_mode()
+    primary_label, primary_func = _ENGINE_MAP.get(primary_mode, _ENGINE_MAP[MODE_GEMMA4])
+    
+    # 1차 시도
+    try:
+        result = await primary_func(messages)
+        # 성공 시 폴백 상태였다면 복귀 처리
+        if is_auto_fallback():
+            clear_auto_fallback()
+            print(f"✅ [AutoFallback] {primary_label} 복구 확인 → {MODE_LABELS[primary_mode]} 모드로 자동 복귀")
+            if _fallback_notify_bot and _fallback_notify_chat_id:
+                try:
+                    await _fallback_notify_bot.send_message(
+                        chat_id=_fallback_notify_chat_id,
+                        text=f"✅ **[자동 복구]** {primary_label}이(가) 다시 정상 작동합니다.\n→ **{MODE_LABELS[primary_mode]} 모드로 자동 복귀**했습니다.",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+        return result
+    except Exception as e:
+        err_msg = str(e)
+        print(f"⚠️ [Fallback] {primary_label} 실패: {err_msg[:100]}")
+    
+    # 자동 폴백 등록
+    if not is_auto_fallback():
+        set_auto_fallback(f"{primary_label} 실패")
+        if _fallback_notify_bot and _fallback_notify_chat_id:
+            try:
+                await _fallback_notify_bot.send_message(
+                    chat_id=_fallback_notify_chat_id,
+                    text=f"⚠️ **[자동 폴백 발동]** {primary_label}이(가) 응답하지 않습니다.\n→ 폴백 체인을 통해 자동 전환합니다.\n\n원인: `{err_msg[:200]}`",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+    
+    # 폴백 체인 시도
+    for fallback_label, fallback_func in _FALLBACK_ORDER:
+        fallback_name = fallback_label.split(" ")[0]
+        if fallback_name == primary_label.split(" ")[0]:
+            continue  # 프라이머리와 동일한 엔진이면 건너뜀
+        try:
+            print(f"🔄 [Fallback] {fallback_label} 시도 중...")
+            result = await fallback_func(messages)
+            actual_text = result[0].strip() if result else ""
+            # 에러 메시지가 아닌 정상 응답인지 확인
+            if actual_text and not actual_text.startswith("❌"):
+                label = f"{fallback_label} (자동폴백)"
+                return (result[0], label)
+        except Exception as e2:
+            print(f"⚠️ [Fallback] {fallback_label} 실패: {str(e2)[:100]}")
+            continue
+    
+    # 모두 실패
+    return "❌ 모든 엔진(Gemma4, DeepSeek, NVIDIA 70B)이 응답하지 않습니다. 잠시 후 다시 시도해 주세요.", "Error"
+
+hybrid_router = HybridRouter(local_llm_func=_call_primary_with_fallback, api_llm_func=_call_deepseek)
+
+# Dreaming 등 모듈이 DummyRouter 대신 실제 라우터를 사용하도록 패치
+import hybrid_router as _hr_mod
+_hr_mod.patch_router(hybrid_router)
+
+async def get_llm_response(messages):
+    mode = get_current_mode()
+    # 프라이머리 모드로 호출 → 실패 시 자동 폴백
+    return await hybrid_router.route_and_execute(messages, force_primary=mode)
+
+
+
+# ── 파일 작업 확인 대기열 (NL 파일 작업 → /confirm → 실행) ──
+_file_op_pending = {}  # {chat_id: {"action": str, "path": str, "dest": str|None}}
+
+# ── 보안 경로 (허용된 작업 영역) ──
+ALLOWED_BASE_PATHS = [
+    "/Users/bluesea/Applications",
+    "/Users/bluesea/hermes",
+    "/Users/bluesea/.hermes"
+]
+
+import pathlib
+def _is_path_allowed(path: str) -> bool:
+    """절대경로가 허용된 베이스 경로 내에 있는지 검사"""
+    resolved = str(pathlib.Path(path).resolve())
+    return any(resolved.startswith(base.rstrip("/") + "/") or resolved == base.rstrip("/")
+               for base in ALLOWED_BASE_PATHS)
+
+def _safe_remove(path: str) -> str:
+    """파일을 영구 삭제 대신 Trash로 이동 (복구 가능)"""
+    import subprocess
+    result = subprocess.run(["osascript", "-e",
+        f'tell application "Finder" to delete POSIX file "{path}"'],
+        capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        # Fallback: shutil.move to Trash
+        trash_dir = os.path.expanduser("~/.Trash")
+        basename = os.path.basename(path)
+        dest = os.path.join(trash_dir, basename)
+        counter = 1
+        while os.path.exists(dest):
+            name, ext = os.path.splitext(basename)
+            dest = os.path.join(trash_dir, f"{name}_{counter}{ext}")
+            counter += 1
+        shutil.move(path, dest)
+        return f"🗑️ Trash로 이동됨: {dest}"
+    return f"🗑️ Finder를 통해 Trash로 이동됨"
+
+async def _handle_file_op(update, context, action, path, dest=None):
+    """파일 작업 실행 (삭제/이동/복사/이름변경)"""
+    try:
+        abs_path = str(pathlib.Path(path).expanduser().resolve())
+        if not _is_path_allowed(abs_path):
+            await update.message.reply_text(f"⛔ 허용되지 않은 경로입니다: {abs_path}")
+            return
+
+        if action == "DELETE":
+            if not os.path.exists(abs_path):
+                await update.message.reply_text(f"⚠️ 파일이 존재하지 않습니다: {abs_path}")
+                return
+            # 사용자 확인 요청
+            _file_op_pending[update.effective_chat.id] = {"action": "DELETE", "path": abs_path}
+            await update.message.reply_text(
+                f"⚠️ **삭제 확인**\n\n"
+                f"파일: `{abs_path}`\n\n"
+                f"정말 삭제하시겠습니까?\n"
+                f"→ `/confirm` 로 승인\n"
+                f"→ `/cancel` 로 취소",
+                parse_mode="Markdown"
+            )
+
+        elif action == "MOVE":
+            if not os.path.exists(abs_path):
+                await update.message.reply_text(f"⚠️ 파일이 존재하지 않습니다: {abs_path}")
+                return
+            abs_dest = str(pathlib.Path(dest).expanduser().resolve())
+            if not _is_path_allowed(abs_dest):
+                await update.message.reply_text(f"⛔ 허용되지 않은 목적지 경로입니다: {abs_dest}")
+                return
+            _file_op_pending[update.effective_chat.id] = {"action": "MOVE", "path": abs_path, "dest": abs_dest}
+            await update.message.reply_text(
+                f"⚠️ **이동 확인**\n\n"
+                f"대상: `{abs_path}`\n"
+                f"목적지: `{abs_dest}`\n\n"
+                f"→ `/confirm` 로 승인\n"
+                f"→ `/cancel` 로 취소",
+                parse_mode="Markdown"
+            )
+
+        elif action == "COPY":
+            abs_dest = str(pathlib.Path(dest).expanduser().resolve())
+            if not _is_path_allowed(abs_dest):
+                await update.message.reply_text(f"⛔ 허용되지 않은 목적지 경로입니다: {abs_dest}")
+                return
+            shutil.copy2(abs_path, abs_dest)
+            await update.message.reply_text(f"✅ 복사 완료: `{abs_path}` → `{abs_dest}`", parse_mode="Markdown")
+
+        elif action == "RENAME":
+            abs_dest = str(pathlib.Path(dest).expanduser().resolve())
+            if os.path.exists(abs_dest):
+                await update.message.reply_text(f"⚠️ 이미 존재하는 파일명입니다: {abs_dest}")
+                return
+            os.rename(abs_path, abs_dest)
+            await update.message.reply_text(f"✅ 이름변경 완료: `{abs_path}` → `{abs_dest}`", parse_mode="Markdown")
+
+        elif action == "CREATE":
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(dest or "")
+            await update.message.reply_text(f"✅ 파일 생성 완료: `{abs_path}`", parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ 파일 작업 실패: {e}")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or update.effective_user.id != config.ALLOWED_ID: return
+    user_text = update.message.text
+
+    # 자동 폴백 알림용 봇 참조 주입 (첫 메시지 수신 시 1회)
+    global _fallback_notify_bot, _fallback_notify_chat_id
+    if _fallback_notify_bot is None:
+        _fallback_notify_bot = context.bot
+        _fallback_notify_chat_id = update.effective_chat.id
+
+    # --- [/confirm, /cancel: 파일 작업 확인/취소] ---
+    if user_text == "/confirm":
+        pending = _file_op_pending.get(update.effective_chat.id)
+        if not pending:
+            await update.message.reply_text("⚠️ 확인 대기 중인 작업이 없습니다.")
+            return
+        action, path = pending["action"], pending["path"]
+        dest = pending.get("dest")
+        try:
+            if action == "DELETE":
+                result = _safe_remove(path)
+                await update.message.reply_text(f"✅ {result}")
+            elif action == "MOVE":
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.move(path, dest)
+                await update.message.reply_text(f"✅ 이동 완료: `{path}` → `{dest}`", parse_mode="Markdown")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ 작업 실패: {e}")
+        finally:
+            _file_op_pending.pop(update.effective_chat.id, None)
+        return
+
+    if user_text == "/cancel":
+        if update.effective_chat.id in _file_op_pending:
+            _file_op_pending.pop(update.effective_chat.id)
+            await update.message.reply_text("❌ 작업이 취소되었습니다.")
+        else:
+            await update.message.reply_text("⚠️ 취소할 대기 작업이 없습니다.")
+        return
+
+    # --- [🔄 모드 전환: 인라인 키보드 표시] ---
+    if user_text == "🔄 모드 전환":
+        from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+        cur_mode = get_current_mode()
+        keyboard = []
+        for mode in ALL_MODES:
+            label = MODE_LABELS[mode]
+            mark = "✅ " if mode == cur_mode else "   "
+            keyboard.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f'mode_sel_{mode}')])
+        await update.message.reply_text(
+            f"⚙️ **현재 모드:** {MODE_LABELS.get(cur_mode, cur_mode)}\n\n"
+            f"사용할 LLM 엔진을 선택해주세요.\n"
+            f"선택한 엔진이 실패하면 자동 폴백됩니다.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+        
+    if user_text.startswith("@"):
+        if user_text.startswith("@검색"):
+            query = user_text.replace("@검색", "").strip()
+            results = get_semantic().search(query)
+            await update.message.reply_text(unicodedata.normalize('NFC', str(results)))
+            return
+        elif user_text == "@상태":
+            _, msg = sys_mon.check_health()
+            await update.message.reply_text(f"🤖 하네스 에이전트 상태\n{msg}")
+            return
+        elif user_text == "@정리":
+            res = await memory.dream(history.history, llm_func=get_llm_response)
+            await update.message.reply_text(res)
+            return
+        elif "@ingest" in user_text or "ingest해줘" in user_text:
+            if ingest_inst:
+                await update.message.reply_text("📂 지식 정원 가꾸기 시작... (Clippings → Wiki)")
+                res = await ingest_inst.process_gardening()
+                await update.message.reply_text(str(res))
+            else:
+                await update.message.reply_text("⚠️ IngestEngine이 초기화되지 않았습니다.")
+            return
+
+    # --- [자연어 파일 작업 라우팅: LLM으로 파일 작업 요청 파싱] ---
+    # "파일 삭제해줘", "파일 지워줘", "이동시켜줘", "복사해줘" 등의 자연어 명령어 처리는 
+    # 오인 하이재킹(예: "시를 만들어줘")을 방지하기 위해 정규식 인터셉트를 비활성화하고,
+    # 하단의 LLM 에이전틱 루프가 태그([CREATE: ...])를 생성하도록 위임합니다.
+    pass
+
+    # --- [P1 Fix: Logic Engine 우선 처리 (파일/목록/읽기 요청은 건너뜀)] ---
+    file_related = any(kw in user_text for kw in
+                       ["파일", "폴더", "디렉토리", "리스트", "목록",
+                        "내용", "읽어", "보여줘", "열어줘", "확인",
+                        "LIST", "READ", "검색", "SEARCH",
+                        "찾아", "찾기", "알려줘",
+                        "삭제", "지워", "제거", "delete",
+                        "이동", "옮겨", "move",
+                        "복사", "copy", "카피",
+                        "이름변경", "rename",
+                        "생성", "만들어줘", "create",
+                        "저장", "save", "SAVE",
+                        "RUN_CMD", "WEB_READ"])
+    if logic and not file_related:
+        try:
+            logic_res = logic.process_message(user_text)
+            # Logic Engine이 실제 응답을 생성한 경우에만 사용 (기본 폴백 응답 제외)
+            if logic_res and "모르겠" not in logic_res and "이해하지 못" not in logic_res:
+                history.add_message("user", user_text)
+                history.add_message("assistant", logic_res)
+                normalized_res = unicodedata.normalize('NFC', logic_res)
+                if "안녕하세요, MJ 박사님!" in normalized_res:
+                    await update.message.reply_text(normalized_res)
+                else:
+                    await update.message.reply_text(f"⚡ [Logic]\n\n{normalized_res}")
+                return
+        except Exception as e:
+            print(f"⚠️ Logic Engine 처리 실패, LLM으로 전환: {e}")
+
+    # --- [지능형 자율 응답 루프] ---
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        # --- [최적화된 시스템 프롬프트 및 협업 가이드] ---
+        sys_prompt = wiki.get_system_context()
+        sys_prompt += "\n\n### [🛠️ AGENT OPERATIONAL GUIDE]"
+        sys_prompt += "\n1. **통합 비서 정체성**: 당신은 '하네스 에이전트'이며, 모든 전문 모듈의 지휘관입니다."
+        sys_prompt += "\n2. **[🚨 절대 규칙] 파일 목록 조회**: 박사님이 파일 목록이나 폴더 내용을 물으실 때, [LIST: 경로] 태그를 반드시 사용해서 실제 파일 시스템을 조회하고, 그 결과만 보고해."
+        sys_prompt += "\n3. **번역 금지**: 영문 파일명(예: guardrails.md)을 임의로 한국어(예: 가드레일.md)로 번역하여 리스트를 만들지 마십시오. 대소문자와 확장자까지 100% 동일하게 사용하십시오."
+        sys_prompt += "\n4. **근거 기반 실행**: [LIST]나 [READ] 결과가 없는 정보는 존재하지 않는 정보로 간주하십시오."
+        sys_prompt += "\n5. **연쇄 행동**: 필요하다면 [LIST] -> [READ] -> [SAVE] 순서로 여러 태그를 연달아 사용하여 작업을 완수하십시오."
+        sys_prompt += "\n6. **웹 검색**: 인터넷 검색이나 최신 정보가 필요할 때는 반드시 [SEARCH: 검색어] 태그를 사용하여 실제 검색 결과를 얻은 후 답변하십시오."
+        sys_prompt += "\n7. **[🚨 카파시 4대 원칙]** 1) 지시가 모호하면 코딩 전 질문하고 대안을 제시하십시오, 2) 가장 단순한 구조의 코드를 구현하십시오, 3) 대상 외에 무관한 파일/코드는 절대 수정하지 마십시오 (Scope 엄수), 4) 불확실하면 솔직히 명시하십시오."
+        sys_prompt += "\n8. **미사여구 배제 (No Filler)**: 대답 시작 시 '물론입니다', '좋은 질문입니다' 등 무의미한 서두 웜업 표현을 배제하고 즉시 본론 및 결과로 답변하십시오."
+        sys_prompt += "\n9. **파일 작업 태그**: 다음과 같은 파일 작업 태그를 사용할 수 있습니다."
+        sys_prompt += "\n   - [DELETE: /절대/경로/파일] : 파일을 휴지통으로 이동 (영구 삭제 아님, 확인 절차 거침)"
+        sys_prompt += "\n   - [MOVE: /원본/경로 -> /목적지/경로] : 파일/폴더 이동"
+        sys_prompt += "\n   - [COPY: /원본/경로 -> /목적지/경로] : 파일/폴더 복사"
+        sys_prompt += "\n   - [RENAME: /원본/경로 -> /새이름/경로] : 파일/폴더 이름 변경"
+        sys_prompt += "\n   - [CREATE: /경로/파일](내용)[/CREATE] : 새 파일 생성"
+        sys_prompt += "\n   박사님이 '이 파일 지워줘', '저 폴더로 옮겨줘', '이거 복사해줘' 등 자연어로 파일 작업을 요청하면 위 태그를 사용하여 실행하세요. DELETE 작업은 확인 후 실행됩니다."
+        sys_prompt += "\n\n[💡 Few-Shot Example: 파일 목록 요청 처리 방법]"
+        sys_prompt += "\nUser: 00_Meta 폴더에 어떤 파일이 있어?"
+        sys_prompt += "\nAssistant: [LIST: /Users/bluesea/Applications/Mjobsidian/wiki/00_Meta]"
+        sys_prompt += "\n(주의: 위와 같이 오직 태그 하나만 출력하고 대기해야 합니다. 절대로 혼자서 파일 이름을 나열하지 마십시오.)"
+        
+        messages = [{"role": "system", "content": sys_prompt}]
+        full_h = history.get_history_for_llm(); messages.extend(full_h[-15:])
+        messages.append({"role": "user", "content": user_text})
+        
+        ans, engine = await get_llm_response(messages)
+        
+        # 에이전틱 루프 (최대 3회 — 태그 연쇄 작업 커버)
+        for _ in range(3):
+            executed = False; exec_results = []
+            m_list = re.search(r"\[LIST:\s*(.*?)\]", ans)
+            if m_list: 
+                target_dir = m_list.group(1).strip()
+                # 원본 LIST 대신 ContextBuilder의 Codebase Map 사용 및 컨텍스트 주입
+                dir_map = ctx_builder.build_directory_map(target_dir)
+                ctx = ctx_builder.load_hierarchical_context(target_dir)
+                exec_results.append(f"[📂 LIST 결과 (필터링 적용)]\n{dir_map}\n\n[📖 폴더 컨텍스트]\n{ctx}"); executed = True
+            
+            m_read = re.search(r"\[READ:\s*(.*?)\]", ans)
+            if m_read: 
+                target_file = m_read.group(1).strip()
+                res = file_m.read_file(target_file)
+                target_dir = os.path.dirname(target_file)
+                ctx = ctx_builder.load_hierarchical_context(target_dir)
+                exec_results.append(f"[📄 READ 결과]\n{res[:3000]}\n\n[📖 파일 컨텍스트]\n{ctx}"); executed = True
+            m_web = re.search(r"\[WEB_READ:\s*(.*?)\]", ans)
+            if m_web:
+                res = web_reader.fetch_url(m_web.group(1).strip())
+                exec_results.append(f"[🌐 WEB 결과]\n{res[:3000]}"); executed = True
+            
+            m_search = re.search(r"\[SEARCH:\s*(.*?)\]", ans)
+            if m_search:
+                import sys
+                if "/Users/bluesea/hermes" not in sys.path:
+                    sys.path.append("/Users/bluesea/hermes")
+                try:
+                    from web_agent_module import search_web
+                    search_res = await search_web(m_search.group(1).strip())
+                    exec_results.append(f"[🔍 SEARCH 결과]\n{search_res}"); executed = True
+                except Exception as e:
+                    exec_results.append(f"[🔍 SEARCH 에러]\n{e}"); executed = True
+                    
+            m_cmd = re.search(r"\[RUN_CMD:\s*(.*?)\]", ans, re.DOTALL)
+            if m_cmd:
+                res = executor.execute_bash_command(m_cmd.group(1).strip())
+                exec_results.append(f"[💻 CMD 결과]\n{res}"); executed = True
+
+            # --- [DELETE/MOVE/COPY/RENAME/CREATE 태그 — 실제 실행] ---
+            m_delete = re.search(r"\[DELETE:\s*(.*?)\]", ans)
+            if m_delete:
+                del_path = m_delete.group(1).strip()
+                # await _handle_file_op로 실행 (update 객체를 직접 전달)
+                import inspect
+                if inspect.iscoroutinefunction(_handle_file_op):
+                    await _handle_file_op(update, context, "DELETE", del_path)
+                exec_results.append(f"[🗑️ DELETE 요청 처리됨: {del_path}]"); executed = True
+            
+            m_move = re.search(r"\[MOVE:\s*(.*?)\s*(?:->|→|to)\s*(.*)\]", ans)
+            if m_move:
+                mv_src = m_move.group(1).strip()
+                mv_dst = m_move.group(2).strip()
+                if inspect.iscoroutinefunction(_handle_file_op):
+                    await _handle_file_op(update, context, "MOVE", mv_src, mv_dst)
+                exec_results.append(f"[📦 MOVE 요청 처리됨: {mv_src} -> {mv_dst}]"); executed = True
+            
+            m_copy = re.search(r"\[COPY:\s*(.*?)\s*(?:->|→|to)\s*(.*)\]", ans)
+            if m_copy:
+                cp_src = m_copy.group(1).strip()
+                cp_dst = m_copy.group(2).strip()
+                if inspect.iscoroutinefunction(_handle_file_op):
+                    await _handle_file_op(update, context, "COPY", cp_src, cp_dst)
+                exec_results.append(f"[📋 COPY 요청 처리됨: {cp_src} -> {cp_dst}]"); executed = True
+            
+            m_rename = re.search(r"\[RENAME:\s*(.*?)\s*(?:->|→|to)\s*(.*)\]", ans)
+            if m_rename:
+                rn_src = m_rename.group(1).strip()
+                rn_dst = m_rename.group(2).strip()
+                if inspect.iscoroutinefunction(_handle_file_op):
+                    await _handle_file_op(update, context, "RENAME", rn_src, rn_dst)
+                exec_results.append(f"[✏️ RENAME 요청 처리됨: {rn_src} -> {rn_dst}]"); executed = True
+
+            if executed:
+                messages.append({"role": "assistant", "content": ans})
+                messages.append({"role": "user", "content": "\n".join(exec_results)})
+                ans, engine = await get_llm_response(messages)
+            else: break
+
+        # [SAVE] 태그: 절대경로·상대경로 모두 지원
+        save_m = re.search(r"\[SAVE:\s*(.*?)\](.*?)\[/SAVE\]", ans, re.DOTALL)
+        if save_m:
+            save_path = save_m.group(1).strip()
+            save_content = save_m.group(2).strip()
+            if os.path.isabs(save_path):
+                # 절대경로: 직접 파일 쓰기
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                with open(save_path, "w", encoding="utf-8") as _f:
+                    _f.write(save_content)
+            else:
+                # 상대경로: vault 기준 file_m 사용
+                file_m.write_file(save_path, save_content)
+
+        history.add_message("user", user_text)
+        history.add_message("assistant", ans)
+        await update.message.reply_text(f"🧠 [{engine}]\n\n" + unicodedata.normalize('NFC', ans))
+        # audit.run_audit() # 필요 시 감사 실행
+        
+    except Exception as e: await update.message.reply_text(f"⚠️ 에러: {e}")
+
+# ──────────────────────────────────────────────────────────────────
+# harness_agent.py는 라이브러리 모드로 동작합니다.
+# hermes_local.py가 유일한 텔레그램 봇 인스턴스이며,
+# 이 모듈의 handle_message()를 import하여 사용합니다.
+#
+# 단독 실행(직접 python3 harness_agent.py)은 테스트/디버그 용도로만 사용하세요.
+# ──────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    ensure_singleton()
+
+    async def auto_heal_loop():
+        while True:
+            try: sys_mon.auto_heal(os.path.join(config.SCRIPTS_DIR, "recovery_system.sh"))
+            except: pass
+            await asyncio.sleep(60)
+
+    async def main():
+        app = Application.builder().token(config.TELEGRAM_TOKEN).build()
+        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+        asyncio.create_task(auto_heal_loop())
+        async with app:
+            await app.initialize(); await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            while True: await asyncio.sleep(3600)
+
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass

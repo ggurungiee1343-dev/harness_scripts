@@ -1,0 +1,18 @@
+# Hermes Ignore File
+# 이 파일에 정의된 확장자나 폴더는 헤르메스가 [LIST] 하거나 [READ] 할 때 무시됩니다.
+# 정규표현식(glob) 패턴을 지원합니다.
+
+__pycache__
+*.pyc
+*.log
+.DS_Store
+.git
+*.tmp
+.claude
+harness_agent.lock
+backup_modular_20260520/
+harness_memory.json
+harness_graph.json
+*.db
+*.sqlite
+.venv/

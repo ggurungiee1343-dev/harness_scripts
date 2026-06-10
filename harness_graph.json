@@ -1,0 +1,32 @@
+{
+  "directed": true,
+  "multigraph": false,
+  "graph": {},
+  "nodes": [
+    {
+      "id": "박사님"
+    },
+    {
+      "id": "사과"
+    },
+    {
+      "id": "달콤하고 빨갛다"
+    }
+  ],
+  "edges": [
+    {
+      "relation": "좋아한다",
+      "importance": 3.0,
+      "timestamp": "2026-05-20T13:29:04",
+      "source": "박사님",
+      "target": "사과"
+    },
+    {
+      "relation": "특징",
+      "importance": 3.0,
+      "timestamp": "2026-05-20T13:29:04",
+      "source": "사과",
+      "target": "달콤하고 빨갛다"
+    }
+  ]
+}

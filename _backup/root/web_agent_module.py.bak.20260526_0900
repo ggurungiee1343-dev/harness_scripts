@@ -1,0 +1,404 @@
+"""
+web_agent_module.py — 대화형 웹 검색 및 읽기 에이전트 모듈 (옵션 1 + 옵션 2 통합본)
+================================================================
+Hermes V2.5 (hermes_local.py) 에 연동하여 구글/빙 수준의 웹 검색과 
+지정한 웹페이지의 본문 추출을 수행하는 모듈입니다.
+
+필요 패키지 설치:
+  pip install aiohttp duckduckgo-search
+
+[옵션 1: LLM Function Calling 용 함수]
+LLM(OpenAI 등)의 tools/functions 에 아래 두 함수를 등록하여 사용할 수 있습니다.
+  1. search_web(query)
+  2. read_webpage(url)
+
+[옵션 2: 수동 텔레그램 명령어]
+  /search [검색어]   — 일반 웹 검색을 수행하고 1~5번까지 리스트를 보여줍니다.
+  /readweb [번호]    — 위에서 검색된 리스트 중 하나를 선택해 본문을 추출합니다.
+"""
+
+import asyncio
+import aiohttp
+import json
+from duckduckgo_search import DDGS
+import uuid
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+
+# ── Action Realization Layer (Life-Harness Layer ❸) ────────────────────
+from modules.action_realization_layer import ActionRealizationLayer
+_action_layer = ActionRealizationLayer.get_instance()
+
+# 검색 결과를 유저별로 임시 저장하기 위한 메모리 딕셔너리
+user_search_memory = {}
+
+# /searchpaper 결과 캐시 (인라인 버튼 상세보기용)
+_paper_cache = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [옵션 1] LLM Function Calling을 위한 순수 Python 함수들 (자율형 에이전트용)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def search_web(query: str, max_results: int = 5) -> list:
+    """
+    (LLM Tool) 웹에서 검색어를 검색하여 제목, URL, 요약(snippet) 리스트를 반환합니다.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        results = await loop.run_in_executor(None, lambda: list(DDGS().text(query, max_results=max_results)))
+        return results
+    except Exception as e:
+        return [{"error": str(e)}]
+
+async def read_webpage(url: str, max_length: int = 3500) -> str:
+    """
+    (LLM Tool) 특정 URL의 웹페이지에 접속하여 광고를 제거하고 본문만 마크다운으로 추출합니다.
+    """
+    jina_url = f"https://r.jina.ai/{url}"
+    headers = {"User-Agent": "HermesWebAgent/1.0"}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(jina_url, headers=headers, timeout=20) as resp:
+                if resp.status == 200:
+                    content = await resp.text()
+                    if len(content) > max_length:
+                        return content[:max_length] + "\n\n...(본문이 너무 길어 생략됨)"
+                    return content
+                else:
+                    return f"Error: Cannot access webpage (Status: {resp.status})"
+    except Exception as e:
+        return f"Error reading webpage: {str(e)}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [옵션 1-2] OpenAlex 학술 논문 검색 (무료, API 키 불필요)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def search_academic_papers(query: str, max_results: int = 5) -> list:
+    """
+    (LLM Tool) OpenAlex API를 통해 학술 논문을 검색합니다.
+    무료, API 키 불필요, 전 분야(법학 포함) 지원, 한글 검색 가능.
+    """
+    import urllib.parse
+    encoded_query = urllib.parse.quote(query)
+    url = (
+        f"https://api.openalex.org/works"
+        f"?filter=default.search:{encoded_query}"
+        f"&sort=cited_by_count:desc"
+        f"&per_page={max_results}"
+    )
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results = data.get("results", [])
+                    papers = []
+                    for r in results:
+                        title = r.get("title") or r.get("display_name", "제목 없음")
+                        year = r.get("publication_year", "?")
+                        citations = r.get("cited_by_count", 0)
+                        doi = r.get("doi", "")
+                        # 저자 추출
+                        authors = []
+                        for a in r.get("authorships", []):
+                            author_name = a.get("author", {}).get("display_name", "")
+                            if author_name:
+                                authors.append(author_name)
+                        author_str = ", ".join(authors[:3])
+                        if len(authors) > 3:
+                            author_str += " et al."
+                        # 저널명
+                        journal = ""
+                        loc = r.get("primary_location", {}) or {}
+                        src = loc.get("source", {}) or {}
+                        if src.get("display_name"):
+                            journal = src["display_name"]
+                        
+                        papers.append({
+                            "title": title,
+                            "year": year,
+                            "citations": citations,
+                            "doi": doi,
+                            "authors": author_str,
+                            "journal": journal,
+                        })
+                    return papers
+                else:
+                    return [{"error": f"OpenAlex API 오류 (Status: {resp.status})"}]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [옵션 2] 텔레그램 챗봇 명령어 핸들러 (수동 호출용)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WebAgentSkills:
+    async def cmd_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """일반 웹 검색 명령어 (/search 검색어)"""
+        args = context.args
+        if not args:
+            await update.message.reply_text("❗ 검색어를 입력해 주세요.\n예: `/search 한국 선박조선 최근 1년 논문`", parse_mode="Markdown")
+            return
+
+        query = " ".join(args)
+        
+        # 🔒 Action Realization Layer 검증
+        search_result = _action_layer.validate("search", query=query)
+        if not search_result.valid:
+            await update.message.reply_text(f"❌ {search_result.message}\n💡 {search_result.suggestion}")
+            return
+        
+        user_id = update.effective_user.id
+        
+        await update.message.reply_text(f"🔍 `{query}` 검색 중...", parse_mode="Markdown")
+
+        results = await search_web(query)
+
+        if not results or "error" in results[0]:
+            error_msg = results[0].get("error", "결과가 없습니다.") if results else "결과가 없습니다."
+            await update.message.reply_text(f"❌ 검색 실패: {error_msg}")
+            return
+
+        # 메모리 초기화 및 저장
+        user_search_memory[user_id] = {}
+        
+        lines = [f"🌐 **'{query}' 검색 결과**\n"]
+        for idx, res in enumerate(results, 1):
+            title = res.get('title', '제목 없음')
+            link = res.get('href', '')
+            snippet = res.get('body', '')
+            
+            # 메모리에 URL 저장
+            user_search_memory[user_id][idx] = link
+            
+            lines.append(f"**[{idx}]** {title}")
+            lines.append(f"📝 {snippet}")
+            lines.append(f"🔗 {link}\n")
+            
+        lines.append("💡 *본문을 읽고 요약하려면 `/readweb 1` 형식으로 번호를 입력하세요.*")
+        
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+    async def cmd_readweb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """지정된 번호 또는 URL의 본문을 추출하는 명령어 (/readweb 번호 또는 URL)"""
+        args = context.args
+        if not args:
+            await update.message.reply_text("❗ 읽을 번호나 URL을 입력해 주세요.\n예: `/readweb 1` 또는 `/readweb https://...`", parse_mode="Markdown")
+            return
+
+        target = args[0]
+        url_to_read = None
+        user_id = update.effective_user.id
+
+        if target.isdigit():
+            idx = int(target)
+            if user_id in user_search_memory and idx in user_search_memory[user_id]:
+                url_to_read = user_search_memory[user_id][idx]
+            else:
+                await update.message.reply_text(f"❌ 이전에 검색한 결과 중 {idx}번을 찾을 수 없습니다. 다시 검색(`/search`)해 주세요.")
+                return
+        elif target.startswith("http"):
+            url_to_read = target
+            
+            # 🔒 Action Realization Layer 검증 (직접 URL 입력 시)
+            url_result = _action_layer.validate("url", url=url_to_read)
+            if not url_result.valid:
+                await update.message.reply_text(f"❌ {url_result.message}\n💡 {url_result.suggestion}")
+                return
+            url_to_read = url_result.canonicalized or url_to_read
+        else:
+            await update.message.reply_text("❗ 올바른 번호(1~5) 또는 URL을 입력해 주세요.")
+            return
+
+        await update.message.reply_text(f"📄 문서 읽는 중...\n🔗 {url_to_read}", disable_web_page_preview=True)
+
+        content = await read_webpage(url_to_read)
+        
+        if content.startswith("Error"):
+            await update.message.reply_text(f"❌ {content}")
+        else:
+            # 봇이 이어받아서 답변할 수 있도록 문구 추가
+            content += "\n\n(헤르메스 봇님, 위 내용을 바탕으로 요약/조사 결과를 유저에게 알려주세요!)"
+            final_msg = f"📚 **본문 추출 완료**\n\n{content}"
+            
+            await update.message.reply_text(final_msg, parse_mode="Markdown", disable_web_page_preview=True)
+
+    async def cmd_searchpaper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/searchpaper 검색어 [개수] — OpenAlex 학술 논문 검색 (무료, 법학 포함 전 분야)"""
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "❗ 검색어를 입력해 주세요.\n"
+                "예: `/searchpaper 한국 민법 개정`\n"
+                "예: `/searchpaper legal reasoning AI`\n"
+                "예: `/searchpaper machine learning 10` (최대 20개)",
+                parse_mode="Markdown"
+            )
+            return
+
+        # 마지막 인자가 숫자면 max_results로 사용
+        max_results = 5
+        try:
+            last_arg = args[-1]
+            n = int(last_arg)
+            if 1 <= n <= 20:
+                max_results = n
+                args = args[:-1]  # 숫자는 검색어에서 제외
+            # n이 범위 밖이면 그냥 검색어 일부로 취급
+        except (ValueError, IndexError):
+            pass
+
+        query = " ".join(args)
+
+        # 🔒 Action Realization Layer 검증
+        paper_result = _action_layer.validate("paper_search", query=query)
+        if not paper_result.valid:
+            await update.message.reply_text(f"❌ {paper_result.message}\n💡 {paper_result.suggestion}")
+            return
+
+        await update.message.reply_text(f"📚 **`{query}`** 학술 논문 검색 중... (OpenAlex, 최대 {max_results}개)", parse_mode="Markdown")
+
+        papers = await search_academic_papers(query, max_results=max_results)
+
+        if not papers:
+            await update.message.reply_text("❌ 검색 결과가 없습니다.")
+            return
+
+        if "error" in papers[0]:
+            await update.message.reply_text(f"❌ 검색 실패: {papers[0]['error']}")
+            return
+
+        # 🔖 캐시에 저장 (인라인 버튼용)
+        cache_key = str(uuid.uuid4())[:8]
+        _paper_cache[cache_key] = papers
+
+        lines = [f"📖 **'{query}' 논문 검색 결과**\n"]
+        keyboard = []
+        for idx, p in enumerate(papers):
+            idx1 = idx + 1
+            title_short = p["title"][:36] + "…" if len(p["title"]) > 36 else p["title"]
+            doi_short = p["doi"].replace("https://doi.org/", "") if p["doi"] else ""
+            lines.append(f"**[{idx1}]** {p['title']}")
+            lines.append(f"👤 {p['authors']} ({p['year']})")
+            if p["journal"]:
+                lines.append(f"📰 {p['journal']}")
+            lines.append(f"📊 인용 {p['citations']}회")
+            if doi_short:
+                lines.append(f"🔗 DOI: `{doi_short}`")
+            lines.append("")
+            # 각 논문에 상세보기 버튼
+            keyboard.append([InlineKeyboardButton(f"🔍 {idx1}. {title_short}", callback_data=f"paper_{cache_key}_{idx}")])
+
+        keyboard.append([InlineKeyboardButton("❌ 닫기", callback_data="paper_close")])
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
+# ── /searchpaper 인라인 버튼 콜백 핸들러 ──────────────────────────────
+async def handle_paper_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """paper_xxx 콜백 처리: 버튼 누르면 해당 논문 상세 정보 표시"""
+    query = update.callback_query
+    data = query.data
+
+    # ❌ 닫기 버튼
+    if data == "paper_close":
+        await query.edit_message_text(query.message.text + "\n\n❌ 검색 결과를 닫았습니다.")
+        await query.answer()
+        return
+
+    # paper_{cache_key}_{idx} 파싱
+    parts = data.split("_", 2)
+    if len(parts) != 3:
+        await query.answer("⚠️ 잘못된 요청입니다.")
+        return
+
+    _, cache_key, idx_str = parts
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await query.answer("⚠️ 잘못된 요청입니다.")
+        return
+
+    papers = _paper_cache.get(cache_key)
+    if not papers or idx >= len(papers):
+        await query.answer("⚠️ 검색 결과가 만료되었습니다. 다시 /searchpaper 해주세요.")
+        return
+
+    p = papers[idx]
+
+    # 상세 정보 문자열 조립
+    lines = [
+        f"📖 **{p['title']}**",
+        f"👤 {p['authors']} ({p['year']})",
+    ]
+    if p.get("journal"):
+        lines.append(f"📰 {p['journal']}")
+    lines.append(f"📊 인용 {p['citations']}회")
+    if p.get("doi"):
+        doi = p["doi"]
+        doi_short = doi.replace("https://doi.org/", "")
+        lines.append(f"🔗 DOI: [{doi_short}]({doi})")
+
+    # OpenAlex 상세 링크
+    lines.append(f"\n🔬 [OpenAlex에서 보기](https://openalex.org/works?search={p['title'][:50]})")
+
+    # 뒤로가기 버튼
+    keyboard = [[InlineKeyboardButton("◀ 목록으로", callback_data=f"paper_back_{cache_key}")]]
+    keyboard.append([InlineKeyboardButton("❌ 닫기", callback_data="paper_close")])
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    await query.answer()
+
+
+# ── paper_back 콜백 (목록으로 돌아가기) ────────────────────────────────
+async def handle_paper_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """paper_back_xxx 콜백: 상세보기에서 검색 목록으로 복원"""
+    query = update.callback_query
+    data = query.data
+    # data = paper_back_{cache_key}
+    cache_key = data.split("_", 2)[2]
+    papers = _paper_cache.get(cache_key)
+    if not papers:
+        await query.answer("⚠️ 검색 결과가 만료되었습니다.")
+        return
+
+    lines = ["📖 **검색 결과**\n"]
+    for idx, p in enumerate(papers):
+        idx1 = idx + 1
+        doi_short = p["doi"].replace("https://doi.org/", "") if p["doi"] else ""
+        lines.append(f"**[{idx1}]** {p['title']}")
+        lines.append(f"👤 {p['authors']} ({p['year']})")
+        if p["journal"]:
+            lines.append(f"📰 {p['journal']}")
+        lines.append(f"📊 인용 {p['citations']}회")
+        if doi_short:
+            lines.append(f"🔗 DOI: `{doi_short}`")
+        lines.append("")
+
+    keyboard = []
+    for idx, p in enumerate(papers):
+        title_short = p["title"][:36] + "…" if len(p["title"]) > 36 else p["title"]
+        keyboard.append([InlineKeyboardButton(f"🔍 {idx+1}. {title_short}", callback_data=f"paper_{cache_key}_{idx}")])
+    keyboard.append([InlineKeyboardButton("❌ 닫기", callback_data="paper_close")])
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    await query.answer()

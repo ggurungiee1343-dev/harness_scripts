@@ -1,0 +1,531 @@
+"""
+Action Realization Layer — Life-Harness Layer ❸
+=================================================
+arXiv 2605.22166 기반 실행 전 액션 검증 레이어.
+
+> "Validates and canonicalizes model-generated actions before execution,
+>  rescuing unambiguous interface-level errors and blocking actions
+>  that would deterministically fail."
+
+설계 원칙:
+- Pre-flight Validation: 실행 전 입력값 검증
+- Canonicalization: 경로/URL 등을 표준 형식으로 정규화
+- Blocking: 결정적 실패가 예측되는 액션 사전 차단
+- Suggestion: 차단 시 명확한 이유 + 대안 제시
+"""
+
+import os
+import re
+import logging
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from modules.policy_engine import PolicyEngine
+
+logger = logging.getLogger("ActionRealization")
+
+# ── Obsidian Vault 베이스 경로 (경로 탈취 방지용) ────────────────────────
+VAULT_BASE = Path("/Users/bluesea/Applications/Mjobsidian").resolve()
+SCRIPTS_BASE = Path("/Users/bluesea/Applications/Mjauto/Scripts").resolve()
+ALLOWED_BASES = [
+    Path("/Users/bluesea/Applications").resolve(),
+    Path("/Users/bluesea/hermes").resolve(),
+    Path("/Users/bluesea/.hermes").resolve(),
+]
+
+# ── 위험 Bash 명령어 패턴 ──────────────────────────────────────────────────
+BASH_DANGEROUS_PATTERNS: list[tuple[str, str, str]] = [
+    # (패턴 regex, 설명, 대안)
+    (r"^\s*rm\s+-rf\s+/\s*$", "전체 파일 시스템 삭제 시도", "rm -rf / 는 허용되지 않습니다. 특정 경로를 지정하세요."),
+    (r"^\s*rm\s+-rf\s+/var", "시스템 디렉토리 삭제 시도", "시스템 디렉토리 삭제는 허용되지 않습니다."),
+    (r"^\s*rm\s+-rf\s+/etc", "시스템 설정 디렉토리 삭제 시도", "시스템 디렉토리 삭제는 허용되지 않습니다."),
+    (r"^\s*dd\s+if=.*of=/dev/", "디스크 직접 쓰기 시도", "dd로 디스크 장치 쓰기는 허용되지 않습니다."),
+    (r":\(\)\{\s*:\s*\|\s*:&\s*\};:", "Fork 폭탄(우주선) 시도", "Fork 폭탄은 허용되지 않습니다."),
+    (r"^\s*chmod\s+-R\s+0{3,4}\s+/", "전체 파일 시스템 권한 제거", "chmod 000 / 는 허용되지 않습니다."),
+    (r"^\s*mkfs\.", "파일 시스템 포맷 시도", "파일 시스템 포맷 명령어는 허용되지 않습니다."),
+    (r"^\s*shutdown\b", "시스템 종료 명령어", "shutdown 명령어는 허용되지 않습니다."),
+    (r"^\s*reboot\b", "시스템 재부팅 명령어", "reboot 명령어는 허용되지 않습니다."),
+    (r"^\s*init\s+0\b", "런레벨 0 (종료) 시도", "init 0 명령어는 허용되지 않습니다."),
+    (r"^\s*poweroff\b", "전원 종료 시도", "poweroff 명령어는 허용되지 않습니다."),
+    (r"^\s*> /dev/sda", "디스크 직접 쓰기 시도", "블록 디바이스 직접 쓰기는 허용되지 않습니다."),
+    (r"^\s*wget\s+.*\|\s*bash\s*$", "파이프라인 원격 코드 실행", "wget | bash 패턴은 안전하지 않습니다. 다운로드 후 확인하세요."),
+    (r"^\s*curl\s+.*\|\s*bash\s*$", "파이프라인 원격 코드 실행", "curl | bash 패턴은 안전하지 않습니다. 다운로드 후 확인하세요."),
+]
+
+# ── 허용되지 않는 URL 프로토콜 ──────────────────────────────────────────────
+FORBIDDEN_URL_PROTOCOLS = {"file://", "ftp://", "smb://", "ldap://"}
+
+
+@dataclass
+class ValidationResult:
+    """액션 검증 결과"""
+    valid: bool = True
+    message: str = ""
+    suggestion: str = ""
+    canonicalized: Optional[str] = None  # 정규화된 값 (있는 경우)
+
+
+def _normalize_path(raw_path: str) -> str:
+    """입력 경로를 절대 경로로 정규화하고 홈 디렉토리 확장"""
+    expanded = os.path.expanduser(raw_path.strip())
+    return os.path.abspath(expanded)
+
+
+def _is_safe_path(resolved_path: str, allowed_bases: list[Path]) -> bool:
+    """경로가 허용된 베이스 디렉토리 내에 있는지 검증 (경로 탈취 방지)"""
+    try:
+        resolved = Path(resolved_path).resolve()
+        for base in allowed_bases:
+            try:
+                resolved.relative_to(base)
+                return True
+            except ValueError:
+                continue
+        return False
+    except Exception:
+        return False
+
+
+# ── Validator 등록소 ────────────────────────────────────────────────────────
+_validators: dict[str, callable] = {}
+
+
+def register_validator(action_type: str):
+    """데코레이터: 액션 타입별 Validator 등록"""
+    def decorator(func):
+        _validators[action_type] = func
+        return func
+    return decorator
+
+
+# ============================================================================
+# Validator 구현
+# ============================================================================
+
+@register_validator("file_read")
+def validate_file_read(path: str = "", **kwargs) -> ValidationResult:
+    """
+    파일 읽기 전 검증:
+    - 경로가 비어있는가?
+    - 경로 탈출 시도인가?
+    - 파일이 존재하는가?
+    """
+    if not path or not path.strip():
+        return ValidationResult(False, "파일 경로가 입력되지 않았습니다.", "읽을 파일의 경로를 입력해주세요. 예: `/read wiki/00_Meta/hot.md`")
+
+    resolved = _normalize_path(path)
+    
+    if not _is_safe_path(resolved, ALLOWED_BASES):
+        return ValidationResult(
+            False,
+            f"🚫 경로 탈출 차단: `{resolved}`",
+            f"허용된 경로: `{', '.join(str(b) for b in ALLOWED_BASES)}` 내의 파일만 읽을 수 있습니다."
+        )
+
+    if not os.path.exists(resolved):
+        # 상대 경로인 경우 각 BASE 기준으로 재시도
+        raw = path.strip()
+        if not raw.startswith('/') and '~' not in raw:
+            found = False
+            for base in ALLOWED_BASES:
+                candidate = str((base / raw).resolve())
+                if os.path.exists(candidate) and _is_safe_path(candidate, ALLOWED_BASES):
+                    resolved = candidate
+                    found = True
+                    break
+            if not found:
+                return ValidationResult(
+                    False,
+                    f"📄 파일을 찾을 수 없음: `{path}`",
+                    f"경로를 확인해주세요. 다음 경로 내에서 검색했습니다: {', '.join(str(b) for b in ALLOWED_BASES)}"
+                )
+        else:
+            return ValidationResult(
+                False,
+                f"📄 파일을 찾을 수 없음: `{path}`",
+                f"경로를 확인해주세요."
+            )
+
+    if os.path.isdir(resolved):
+        return ValidationResult(
+            False,
+            f"📁 디렉토리는 읽을 수 없음: `{path}`",
+            "디렉토리 대신 파일 경로를 입력해주세요. 디렉토리 목록은 `/list` 명령어를 사용하세요."
+        )
+    
+    # 바이너리 파일 감지 (선검사)
+    try:
+        with open(resolved, "rb") as f:
+            head = f.read(1024)
+            if b"\x00" in head:
+                return ValidationResult(
+                    False,
+                    f"🔒 바이너리 파일은 읽을 수 없음: `{path}`",
+                    "텍스트 파일만 읽을 수 있습니다. PDF/이미지 파일은 다른 도구를 사용해주세요."
+                )
+    except Exception:
+        pass
+
+    # 큰 파일 경고
+    size_mb = os.path.getsize(resolved) / (1024 * 1024)
+    if size_mb > 10:
+        return ValidationResult(
+            False,
+            f"📦 파일이 너무 큼 ({size_mb:.1f}MB): `{path}`",
+            "10MB 이하의 텍스트 파일만 읽을 수 있습니다."
+        )
+
+    return ValidationResult(True, canonicalized=resolved)
+
+
+@register_validator("file_create")
+def validate_file_create(path: str = "", content: str = "", **kwargs) -> ValidationResult:
+    """
+    파일 생성 전 검증:
+    - 경로 안전성
+    - 이미 존재하는 파일 덮어쓰기
+    - 허용된 디렉토리 내
+    """
+    if not path or not path.strip():
+        return ValidationResult(False, "파일명이 입력되지 않았습니다.", "생성할 파일명을 입력해주세요. 예: `/create inbox/메모.md 내용`")
+
+    resolved = _normalize_path(path)
+
+    if not _is_safe_path(resolved, ALLOWED_BASES):
+        return ValidationResult(
+            False,
+            f"🚫 경로 탈출 차단: `{resolved}`",
+            f"파일은 허용된 경로 내에만 생성할 수 있습니다: {', '.join(str(b) for b in ALLOWED_BASES)}"
+        )
+
+    if os.path.exists(resolved):
+        return ValidationResult(
+            False,
+            f"⚠️ 파일이 이미 존재함: `{path}`",
+            "이미 존재하는 파일입니다. 다른 이름을 사용하거나 다른 명령어를 활용하세요."
+        )
+
+    return ValidationResult(True, canonicalized=resolved)
+
+
+@register_validator("file_delete")
+def validate_file_delete(path: str = "", **kwargs) -> ValidationResult:
+    """
+    파일 삭제(휴지통 이동) 전 검증:
+    - 경로 안전성
+    - 파일 존재 확인
+    - 시스템 중요 파일 보호
+    """
+    if not path or not path.strip():
+        return ValidationResult(False, "파일 경로가 입력되지 않았습니다.", "삭제할 파일 경로를 입력해주세요. 예: `/delete wiki/임시파일.md`")
+
+    resolved = _normalize_path(path)
+
+    if not _is_safe_path(resolved, ALLOWED_BASES):
+        return ValidationResult(False, f"🚫 경로 탈출 차단", "허용된 경로 내 파일만 삭제할 수 있습니다.")
+
+    if not os.path.exists(resolved):
+        return ValidationResult(False, f"📄 파일을 찾을 수 없음: `{path}`", "경로를 확인해주세요.")
+
+    if os.path.isdir(resolved):
+        return ValidationResult(False, f"📁 디렉토리 삭제 제한: `{path}`", "폴더는 삭제할 수 없습니다. 개별 파일만 삭제(휴지통 이동) 가능합니다.")
+
+    return ValidationResult(True, canonicalized=resolved)
+
+
+@register_validator("file_rename")
+def validate_file_rename(path: str = "", new_name: str = "", **kwargs) -> ValidationResult:
+    """
+    파일 이름 변경 전 검증:
+    - 경로 안전성
+    - 파일 존재 확인
+    - 새 이름 유효성
+    """
+    if not path or not path.strip():
+        return ValidationResult(False, "파일 경로가 입력되지 않았습니다.", "이름을 변경할 파일 경로를 입력해주세요. 예: `/rename inbox/임시.md 새이름.md`")
+
+    if not new_name or not new_name.strip():
+        return ValidationResult(False, "새 파일명이 입력되지 않았습니다.", "새 파일명을 입력해주세요. 예: `/rename inbox/임시.md 새이름.md`")
+
+    resolved = _normalize_path(path)
+    new_name_clean = new_name.strip()
+
+    # 새 이름에 경로 구분자가 포함되면 차단 (단순 이름 변경만 허용)
+    if '/' in new_name_clean or '\\' in new_name_clean:
+        return ValidationResult(False, f"📁 새 이름에 경로 구분자 포함: `{new_name_clean}`", "파일명만 변경 가능합니다. 위치 이동은 `/move`를 사용하세요.")
+
+    if not _is_safe_path(resolved, ALLOWED_BASES):
+        return ValidationResult(False, f"🚫 경로 탈출 차단", "허용된 경로 내 파일만 이름을 변경할 수 있습니다.")
+
+    if not os.path.exists(resolved):
+        return ValidationResult(False, f"📄 파일을 찾을 수 없음: `{path}`", "경로를 확인해주세요.")
+
+    # 새 이름으로 동일 경로에 이미 존재하는지 확인
+    new_path = Path(resolved).parent / new_name_clean
+    if new_path.exists():
+        return ValidationResult(False, f"⚠️ 이미 동일한 이름의 파일이 존재함: `{new_name_clean}`", "다른 이름을 사용해주세요.")
+
+    return ValidationResult(True, canonicalized=resolved)
+
+
+@register_validator("file_list")
+def validate_file_list(path: str = "", **kwargs) -> ValidationResult:
+    """
+    디렉토리 목록 출력 전 검증:
+    - 경로 안전성
+    - 디렉토리 존재 확인
+    """
+    if not path or not path.strip():
+        return ValidationResult(True, canonicalized=".")  # 기본 경로는 통과
+
+    # 허용 경로 내인지만 검증 (존재하지 않아도 목록은 시도 가능)
+    resolved = _normalize_path(path)
+    safe = _is_safe_path(resolved, ALLOWED_BASES)
+
+    if not safe:
+        return ValidationResult(False, f"🚫 경로 탈출 차단", "허용된 경로 내 디렉토리만 조회 가능합니다.")
+
+    return ValidationResult(True, canonicalized=resolved)
+
+
+@register_validator("file_move_copy")
+def validate_file_move_copy(source: str = "", destination: str = "", **kwargs) -> ValidationResult:
+    """파일 이동/복사 전 검증"""
+    if not source or not destination:
+        return ValidationResult(False, "출발지와 목적지 경로가 모두 필요합니다.", "예: `/move inbox/파일.md wiki/폴더/`")
+
+    src_resolved = _normalize_path(source)
+    dst_resolved = _normalize_path(destination)
+
+    if not _is_safe_path(src_resolved, ALLOWED_BASES):
+        return ValidationResult(False, f"🚫 출발지 경로 탈출: `{source}`", "허용된 경로 내 파일만 이동할 수 있습니다.")
+
+    if not _is_safe_path(dst_resolved, ALLOWED_BASES):
+        return ValidationResult(False, f"🚫 목적지 경로 탈출: `{destination}`", "허용된 경로 내로만 이동할 수 있습니다.")
+
+    if not os.path.exists(src_resolved):
+        return ValidationResult(False, f"📄 출발지 파일 없음: `{source}`", "해당 경로에 파일이 존재하는지 확인해주세요.")
+
+    if os.path.exists(dst_resolved) and os.path.isdir(src_resolved) == os.path.isdir(dst_resolved):
+        return ValidationResult(False, f"⚠️ 목적지에 이미 파일/폴더가 존재함: `{destination}`", "덮어쓰기를 원하면 먼저 기존 파일을 삭제하거나 다른 목적지를 선택하세요.")
+    
+    # 디렉토리를 목적지로 지정한 경우 (이동의 표준 패턴)
+    if os.path.isdir(dst_resolved):
+        # source filename을 destination에 추가한 전체 경로 계산
+        target = Path(dst_resolved) / Path(src_resolved).name
+        if target.exists():
+            return ValidationResult(False, f"⚠️ 목적지에 동일 파일명이 존재함: `{target.name}`", "다른 이름으로 이동하거나 기존 파일을 먼저 처리하세요.")
+        return ValidationResult(True, canonicalized=str(target))
+
+    return ValidationResult(True, canonicalized=dst_resolved)
+
+
+@register_validator("url")
+def validate_url(url: str = "", **kwargs) -> ValidationResult:
+    """URL 검증"""
+    if not url or not url.strip():
+        return ValidationResult(False, "URL이 입력되지 않았습니다.", "분석할 웹페이지 URL을 입력해주세요.")
+
+    url = url.strip()
+
+    # 프로토콜 누락 시 https:// 자동 추가 (정규화)
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    # 금지 프로토콜 체크
+    for proto in FORBIDDEN_URL_PROTOCOLS:
+        if url.startswith(proto):
+            return ValidationResult(False, f"🚫 허용되지 않는 프로토콜: `{proto}`", "HTTP/HTTPS URL만 지원됩니다.")
+
+    # URL 기본 형식 검증
+    url_pattern = re.compile(
+        r"^https?://"  # 프로토콜
+        r"([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}"  # 도메인
+        r"(:\d+)?"  # 포트 (옵션)
+        r"(/.*)?$"  # 경로 (옵션)
+    )
+    if not url_pattern.match(url):
+        return ValidationResult(False, f"🔗 올바르지 않은 URL 형식: `{url}`", "올바른 URL 형식인지 확인해주세요. 예: `https://example.com/page`")
+
+    return ValidationResult(True, canonicalized=url)
+
+
+@register_validator("bash_exec")
+def validate_bash_exec(command: str = "", **kwargs) -> ValidationResult:
+    """Bash 명령어 검증 — 위험 패턴 차단"""
+    if not command or not command.strip():
+        return ValidationResult(False, "명령어가 입력되지 않았습니다.", "실행할 Bash 명령어를 입력해주세요.")
+
+    cmd_stripped = command.strip()
+
+    for pattern, desc, suggestion in BASH_DANGEROUS_PATTERNS:
+        if re.match(pattern, cmd_stripped, re.IGNORECASE):
+            logger.warning(f"[ActionRealization] 🚫 위험 명령어 차단: {desc} — 명령어: {cmd_stripped[:80]}")
+            return ValidationResult(
+                False,
+                f"🚫 **차단됨**: {desc}",
+                f"💡 {suggestion}"
+            )
+
+    return ValidationResult(True)
+
+
+@register_validator("search")
+def validate_search(query: str = "", **kwargs) -> ValidationResult:
+    """검색어 검증"""
+    if not query or not query.strip():
+        return ValidationResult(False, "검색어가 입력되지 않았습니다.", "검색할 내용을 입력해주세요. 예: `/search 머신러닝 기초`")
+
+    query = query.strip()
+    
+    if len(query) < 2:
+        return ValidationResult(False, f"🔍 검색어가 너무 짧음: `{query}`", "2글자 이상의 검색어를 입력해주세요.")
+
+    # 과도하게 긴 검색어 제한
+    if len(query) > 500:
+        return ValidationResult(False, f"📏 검색어가 너무 김 ({len(query)}자)", "500자 이내로 검색어를 입력해주세요.")
+
+    return ValidationResult(True, canonicalized=query)
+
+
+@register_validator("paper_search")
+def validate_paper_search(query: str = "", **kwargs) -> ValidationResult:
+    """학술 논문 검색어 검증"""
+    if not query or not query.strip():
+        return ValidationResult(False, "검색어가 입력되지 않았습니다.", "검색할 논문 주제나 키워드를 입력해주세요. 예: `/searchpaper reinforcement learning`")
+
+    query = query.strip()
+    
+    if len(query) < 2:
+        return ValidationResult(False, f"🔍 검색어가 너무 짧음: `{query}`", "2글자 이상의 검색어를 입력해주세요.")
+
+    if len(query) > 300:
+        return ValidationResult(False, f"📏 검색어가 너무 김 ({len(query)}자)", "300자 이내로 검색어를 입력해주세요.")
+
+    return ValidationResult(True, canonicalized=query)
+
+
+@register_validator("ingest")
+def validate_ingest(**kwargs) -> ValidationResult:
+    """ingest 실행 전 환경 검증"""
+    clippings_dir = VAULT_BASE / "Clippings"
+    
+    if not clippings_dir.exists():
+        return ValidationResult(False, f"📁 Clippings 폴더 없음: `{clippings_dir}`", "Clippings 폴더가 존재하지 않습니다. 먼저 폴더를 생성해주세요.")
+
+    files = list(clippings_dir.iterdir())
+    if not files:
+        return ValidationResult(False, f"📂 Clippings 폴더에 처리할 파일이 없습니다.", "새로운 클리핑 파일을 Clippings 폴더에 추가한 후 다시 시도해주세요.")
+
+    # txt/md 파일만 있는지 확인
+    text_files = [f for f in files if f.suffix.lower() in (".txt", ".md", ".html", ".json")]
+    if not text_files:
+        return ValidationResult(False, f"📂 처리 가능한 텍스트 파일이 없습니다.", "txt, md, html, json 형식의 파일만 처리 가능합니다.")
+
+    return ValidationResult(True, canonicalized=str(len(text_files)))
+
+
+# ============================================================================
+# ActionRealizationLayer — 싱글톤 검증 레이어
+# ============================================================================
+
+class ActionRealizationLayer:
+    """
+    실행 전 액션 검증 레이어 (싱글톤)
+    
+    사용법:
+        layer = ActionRealizationLayer.get_instance()
+        result = layer.validate("file_read", path="/some/file.md")
+        if not result.valid:
+            # 차단 메시지 출력
+        # result.canonicalized 로 정규화된 값 사용
+    """
+    _instance: Optional["ActionRealizationLayer"] = None
+
+    def __init__(self, policy_engine: Optional["PolicyEngine"] = None):
+        self._validators = dict(_validators)
+        self._stats: dict[str, dict] = {}  # action_type → {pass, block, total}
+        self._policy_engine = policy_engine
+        if self._policy_engine:
+            self._policy_engine.load_policy()
+            logger.info(f"[ActionRealizationLayer] 🛡️ Policy Engine 연동됨")
+        logger.info(f"[ActionRealizationLayer] 🛡️ 초기화 완료 — {len(self._validators)}개 Validator 등록")
+        for name in sorted(self._validators):
+            logger.info(f"  └─ validator: {name}")
+
+    @classmethod
+    def get_instance(cls, policy_engine: Optional["PolicyEngine"] = None) -> "ActionRealizationLayer":
+        if cls._instance is None:
+            cls._instance = cls(policy_engine=policy_engine)
+        elif policy_engine is not None and cls._instance._policy_engine is None:
+            cls._instance._policy_engine = policy_engine
+            policy_engine.load_policy()
+            logger.info(f"[ActionRealizationLayer] 🛡️ Policy Engine 런타임 연결됨")
+        return cls._instance
+
+    def validate(self, action_type: str, **params) -> ValidationResult:
+        """
+        액션 실행 전 검증 수행.
+        
+        Args:
+            action_type: 액션 타입 (file_read, url, bash_exec, search, ...)
+            **params: 검증에 필요한 파라미터
+        
+        Returns:
+            ValidationResult
+        """
+        validator = self._validators.get(action_type)
+        
+        if action_type not in self._stats:
+            self._stats[action_type] = {"pass": 0, "block": 0, "total": 0}
+        
+        self._stats[action_type]["total"] += 1
+
+        if validator is None:
+            # 등록되지 않은 액션 타입은 통과 (기본 허용)
+            self._stats[action_type]["pass"] += 1
+            return ValidationResult(True)
+
+        result = validator(**params)
+
+        if result.valid:
+            self._stats[action_type]["pass"] += 1
+            # [Feature 5] Policy Engine 정책 검증 (통과 후 추가 검증)
+            if self._policy_engine:
+                # Extract mode from params if available, fallback to empty string
+                current_mode = params.get("_mode", "")
+                action_path = params.get("path", params.get("source", ""))
+                policy_result = self._policy_engine.check_action(
+                    action=action_type,
+                    mode=current_mode,
+                    action_path=action_path,
+                )
+                if not policy_result["allowed"]:
+                    self._stats[action_type]["block"] += 1
+                    msg = policy_result.get("reason", "정책에 의해 차단됨")
+                    logger.info(
+                        f"[ActionRealizationLayer] 🚫 Policy 차단: {action_type} → {msg}"
+                    )
+                    return ValidationResult(
+                        valid=False,
+                        message=msg,
+                        suggestion="정책을 확인하거나 다른 모드로 전환해보세요.",
+                    )
+        else:
+            self._stats[action_type]["block"] += 1
+            logger.info(
+                f"[ActionRealizationLayer] 🚫 {action_type} 차단: "
+                f"{result.message[:80]}"
+            )
+
+        return result
+
+    def get_stats(self) -> dict[str, dict]:
+        """검증 통계 반환"""
+        return dict(self._stats)
+
+    def reset_stats(self):
+        """통계 리셋"""
+        self._stats.clear()

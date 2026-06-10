@@ -1,0 +1,504 @@
+"""
+hermes_local.py — 헤르메스 V2.5 자율 관제 봇 메인 엔트리
+======================================================
+모든 구체적 명령어 핸들러는 서브 모듈(hermes_handlers, hermes_harness, hermes_file_ops)로
+분리되어 있으며, 이 파일은 초기 기동, 설정 및 라우팅 등록만을 담당합니다.
+"""
+
+import os
+import sys
+import shutil
+import unicodedata
+import logging
+import fcntl
+import atexit
+import importlib
+import subprocess
+from pathlib import Path
+
+# ── sys.path 우선 설정 ─────────────────────────────────────────────────────
+_SCRIPTS_DIR = "/Users/bluesea/Applications/Mjauto/Scripts"
+_MODULES_DIR = "/Users/bluesea/Applications/Mjauto/Scripts/modules"
+_HERMES_DIR  = "/Users/bluesea/Applications/Mjauto/Scripts"
+for _p in [_SCRIPTS_DIR, _MODULES_DIR, _HERMES_DIR]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, CallbackQueryHandler
+)
+from telegram.error import Conflict, TelegramError
+
+# ── 지연 로딩 캐시 ──────────────────────────────────────────────────────────
+_module_cache = {}
+
+def _load_module(name: str):
+    if name not in _module_cache:
+        _module_cache[name] = importlib.import_module(name)
+    return _module_cache[name]
+
+# ── 로거 ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("HermesOrchestrator")
+
+# ── Global error handler ───────────────────────────────────────────────────
+async def global_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.warning(f"Telegram Conflict error: {err}")
+        return
+    elif isinstance(err, TelegramError):
+        logger.error(f"Telegram error: {err}")
+        return
+    else:
+        logger.exception(f"Unexpected error: {err}")
+        return
+
+# ── 하네스 제어 레이어 통합 ───────────────────────────────────────────────
+try:
+    from agent_harness import AgentHarness
+    from harness_config import HarnessConfig as HCFG
+    HARNESS_ENABLED = True
+except ImportError:
+    HARNESS_ENABLED = False
+    logger.warning("[하네스] agent_harness.py 또는 harness_config.py 를 찾을 수 없습니다. /harness 명령어가 비활성화됩니다.")
+
+from history_manager import HistoryManager
+from wiki_manager import WikiManager
+
+# 🔒 무의존성 .env 환경 변수 로더
+def load_custom_env(env_path=Path("/Users/bluesea/.hermes/.env")):
+    if env_path.exists():
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        val = v.strip().strip("'\"")
+                        os.environ[k.strip()] = val
+
+load_custom_env()
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+ALLOWED_ID_STR = os.environ.get("TELEGRAM_ALLOWED_USERS", "5365732604")
+ALLOWED_ID = int(ALLOWED_ID_STR.split(",")[0])
+
+BASE_DIR = Path("/Users/bluesea/Applications/Mjobsidian").resolve()
+ALLOWED_BASES = [
+    Path("/Users/bluesea/Applications").resolve(),
+    Path("/Users/bluesea/hermes").resolve(),
+    Path("/Users/bluesea/.hermes").resolve(),
+    Path("/Users/bluesea/Applications/venu").resolve(),
+]
+
+# 📋 도움말 텍스트 (pyc 의존 없이 직접 정의)
+HELP_TEXT = (
+    "🤖 **헤르메스 V2.5 명령어 가이드**\n"
+    "\n"
+    "🔹 **인텔리전스 & 팩트체크**\n"
+    "• `/ask [질문 내용]` — (기본) 빠른 답변 및 위키 기반 Q&A\n"
+    "• `/cove [질문 내용]` — Gemma4 CoVe 팩트체크 4단계 심층 분석\n"
+    "• `/clip [질문]` — 클립보드 내용 캡처 및 질문 분석\n"
+    "• `/web [URL] [질문]` — 입력한 인터넷 주소의 내용을 요약/분석\n"
+    "• `/search [검색어]` — 웹 브라우징 검색 및 결과 요약\n"
+    "• `/readweb [URL]` — 웹페이지 내용을 읽어서 요약\n"
+    "• `/searchpaper [검색어]` — OpenAlex API 기반 학술 논문 검색 (법학 포함 전 분야)\n"
+    "• `/exec [명령어]` — 🤖 AI 자율 에러 수정 + 홈 디렉토리 기반 Bash 실행\n"
+    "\n"
+    "🧠 **메모리 & 학습**\n"
+    "• `/memory` — 💡 3계층 메모리 상태 (Deriver + Dialectic + Dreamer)\n"
+    "• `/memory_search [키워드]` — 🔍 L2/L3 통합 메모리 검색\n"
+    "• `/memory_dream` — 🌙 L1→L2→L3 메모리 승격 Dreaming 실행\n"
+    "• `/memory_audit` — 📋 메모리 3계층 종합 감사 (Layer/Source/Expiry)\n"
+    "• `/dreaming` — 📝 대화/작업 → Journal/Memory/hot.md 자동 분배\n"
+    "\n"
+    "🪴 **지식 정원 & 동기화**\n"
+    "• `/ingest` — Clippings 신규 파일을 위키로 자동 분류 이관 (원본 Archive 보존)\n"
+    "\n"
+    "🛡️ **하네스 컨트롤**\n"
+    "• `/harness` — ACID 하네스 상태 조회 및 제어 설정\n"
+    "• `/hdod` — 하네스 DoD(Defense-in-Depth) 진단\n"
+    "• `/hstatus` — 시스템 진단 리포트 (CPU/메모리/디스크/LLM)\n"
+    "• `/hrollback` — 하네스 의사결정 롤백 실행\n"
+    "\n"
+    "⚙️ **세션 설정**\n"
+    "• `/profile [모드]` — 작업 모드 변경 (writer/analyst/default)\n"
+    "\n"
+    "📁 **파일 관리 (확인 후 실행)**\n"
+    "• `/list [경로]` — 📂 경로 내 파일/폴더 목록 출력\n"
+    "• `/create [경로/파일명] [내용]` — 📝 허용 경로 내 파일 생성\n"
+    "• `/read [경로/파일명]` — 📖 텍스트 파일 안전 읽기 (바이너리/길이 자동 제한)\n"
+    "• `/move [현재경로/파일명] [대상폴더]` — 🚚 지정 폴더로 안전 이동\n"
+    "• `/copy [현재경로/파일명] [대상경로]` — 📋 파일 안전 복사\n"
+    "• `/rename [경로/파일명] [새이름]` — ✏️ 파일/폴더 이름 변경\n"
+    "• `/delete [경로/파일명]` — 🗑️ 휴지통(~/.Trash)으로 안전 이동 (복구 가능)\n"
+    "• `/confirm` — ✅ 마지막 보류 중인 파일 작업 승인\n"
+    "• `/cancel` — ❌ 마지막 보류 중인 파일 작업 취소\n"
+    "\n"
+    "📌 **작업 경로 안내**\n"
+    "• `/exec` 명령어: **홈 디렉토리(/Users/bluesea)** 기준 실행 (전체 접근 가능)\n"
+    "• 파일 명령어(/delete, /rename 등): 허용 경로 내에서만 작동 — Applications/, hermes/, .hermes/\n"
+    "\n"
+    "📊 **모니터링 & 상태**\n"
+    "• `/recent` — 옵시디언 위키 최근 수정 문서 5개 목록 및 요약 확인\n"
+    "• `/status` — 실제 OS 여유 메모리 진입 및 시스템 핫토픽 점검"
+)
+
+# 글로벌 상태 저장소
+PENDING_TASKS = {}
+HARNESS_SESSIONS = {}
+
+# 🗣️ 지속성 대화 히스토리 매니저
+history_mgr = HistoryManager("/Users/bluesea/Applications/Mjauto/Scripts/harness_memory.json")
+wiki_mgr    = WikiManager(vault_path=str(BASE_DIR))
+
+
+def init_dir():
+    """작업 폴더 무결성 확인 및 자동 개설"""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    (BASE_DIR / "inbox").mkdir(exist_ok=True)
+    (BASE_DIR / "working").mkdir(exist_ok=True)
+    (BASE_DIR / "outbox").mkdir(exist_ok=True)
+
+
+async def check_user(update: Update) -> bool:
+    """박사님 아이디 전용 보안 필터"""
+    if not update.effective_user or update.effective_user.id != ALLOWED_ID:
+        return False
+    return True
+
+
+def secure_path(user_path_str: str) -> Path:
+    """경로 이탈 방지 및 NFC 한글 정규화 — 허용 Base 내에서만 접근"""
+    normalized_str = unicodedata.normalize('NFC', user_path_str)
+    path_obj = Path(normalized_str)
+    
+    if path_obj.is_absolute():
+        target_path = path_obj.resolve()
+        for base in ALLOWED_BASES:
+            try:
+                target_path.relative_to(base)
+                return target_path
+            except ValueError:
+                continue
+    else:
+        # 상대 경로인 경우 우선 파일이 존재하는지 각 Base에서 확인
+        for base in ALLOWED_BASES:
+            candidate = (base / path_obj).resolve()
+            try:
+                candidate.relative_to(base)
+                if candidate.exists():
+                    return candidate
+            except ValueError:
+                continue
+        # 파일이 존재하지 않는 경우 (생성 등), 첫 번째 Base 기준으로 반환
+        candidate = (ALLOWED_BASES[0] / path_obj).resolve()
+        try:
+            candidate.relative_to(ALLOWED_BASES[0])
+            return candidate
+        except ValueError:
+            pass
+
+    raise PermissionError(
+        "Access Denied: 허용된 작업 공간 외부의 경로입니다.\n"
+        f"허용 경로: {', '.join(str(b) for b in ALLOWED_BASES)}"
+    )
+
+
+def _make_keyboard():
+    """하단 버튼 키보드 생성 (단일 정의, 전체 공유)"""
+    keyboard = [
+        [KeyboardButton("🌙 Dreaming"), KeyboardButton("📁 최근 문서")],
+        [KeyboardButton("📥 Ingest"),   KeyboardButton("ℹ️ 도움말")],
+        [KeyboardButton("🧠 메모리"),    KeyboardButton("🔄 모드 전환")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+
+# ── 세션 종료 훅 (Layer 4: Memory Close-out) ──────────────────────────────────
+def _run_end_hook():
+    """atexit 등록용: hooks/end.sh 실행 (Obsidian Codex 동기화 + 텔레그램 알림)"""
+    import logging as _log
+    hook_path = os.path.expanduser("~/.hermes/hooks/end.sh")
+    if os.path.exists(hook_path):
+        try:
+            result = subprocess.run(
+                ["bash", hook_path],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                _log.getLogger("HermesOrchestrator").info(
+                    f"[Close-out] end.sh 완료: {result.stdout.strip()}"
+                )
+            else:
+                _log.getLogger("HermesOrchestrator").warning(
+                    f"[Close-out] end.sh 오류 (code={result.returncode}): {result.stderr.strip()}"
+                )
+        except Exception as e:
+            _log.getLogger("HermesOrchestrator").exception(
+                f"[Close-out] end.sh 실행 실패: {e}"
+            )
+
+
+# =============================================================================
+# 🚀 메인 진입점
+# =============================================================================
+
+def main():
+    # ── 단일 인스턴스 잠금 ─────────────────────────────────────────────────
+    LOCK_FILE = Path(Path.home() / ".hermes" / "hermes_local.lock")
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fp = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("⚠️  다른 hermes_local 인스턴스가 이미 실행 중입니다. 종료합니다.")
+        sys.exit(0)
+    atexit.register(lambda: (fcntl.flock(lock_fp, fcntl.LOCK_UN), lock_fp.close()))
+    atexit.register(_run_end_hook)
+
+    if not TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN이 설정되지 않았습니다. .env 파일을 다시 확인해 주세요.")
+        sys.exit(1)
+
+    init_dir()
+    app = Application.builder().token(TOKEN).build()
+
+    # ── 봇 재시작 시 자동으로 키보드 재전송 ──────────────────────────────
+    async def post_init(application):
+        try:
+            await application.bot.send_message(
+                chat_id=ALLOWED_ID,
+                text="🔄 **Harness V2.5 재가동 완료** — 하단 버튼 메뉴를 복원합니다.",
+                reply_markup=_make_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"[post_init] 키보드 자동 전송 실패 (무시): {e}")
+    app.post_init = post_init
+
+    # ── 서브 모듈 핸들러 동적 바인딩 (순환 참조 방지) ────────────────────
+    def _load_handler(name):
+        mod = _load_module('hermes_handlers')
+        return getattr(mod, name)
+
+    cmd_start              = lambda *a, **kw: _load_handler('cmd_start')(*a, **kw)
+    async def cmd_help(update, context):
+        if not await check_user(update): return
+        await update.message.reply_text(HELP_TEXT, parse_mode='Markdown')
+    cmd_ask                = lambda *a, **kw: _load_handler('cmd_ask')(*a, **kw)
+    cmd_cove               = lambda *a, **kw: _load_handler('cmd_cove')(*a, **kw)
+    cmd_web                = lambda *a, **kw: _load_handler('cmd_web')(*a, **kw)
+    cmd_ingest             = lambda *a, **kw: _load_handler('cmd_ingest')(*a, **kw)
+    cmd_dreaming           = lambda *a, **kw: _load_handler('cmd_dreaming')(*a, **kw)
+    cmd_exec               = lambda *a, **kw: _load_handler('cmd_exec')(*a, **kw)
+    cmd_clip               = lambda *a, **kw: _load_handler('cmd_clip')(*a, **kw)
+    cmd_recent             = lambda *a, **kw: _load_handler('cmd_recent')(*a, **kw)
+    cmd_status             = lambda *a, **kw: _load_handler('cmd_status')(*a, **kw)
+    cmd_goal               = lambda *a, **kw: _load_handler('cmd_goal')(*a, **kw)
+    cmd_kanban             = lambda *a, **kw: _load_handler('cmd_kanban')(*a, **kw)
+    async def handle_button_callback(update, context):
+        query = update.callback_query
+        if query and query.data and query.data.startswith('paper_'):
+            try:
+                if query.data.startswith('paper_back_'):
+                    return await _web.handle_paper_back(update, context)
+                return await _web.handle_paper_callback(update, context)
+            except Exception as e:
+                print(f"⚠️ [paper_callback] 오류: {e}")
+                await query.answer("⚠️ 논문 정보 처리 중 오류가 발생했습니다.")
+                return
+        orig = _load_handler('handle_button_callback')
+        return await orig(update, context)
+    handle_text_message    = lambda *a, **kw: _load_handler('handle_text_message')(*a, **kw)
+
+    # 🔧 hermes_handlers.cmd_help monkey-patch (ℹ️ 도움말 버튼에서도 HELP_TEXT 사용)
+    _load_module('hermes_handlers').cmd_help = cmd_help
+
+    # ── hermes_file_ops 지연 로드 (순환 임포트 방지) ──────────────────────
+    try:
+        _fops = _load_module('hermes_file_ops')
+        cmd_create  = _fops.cmd_create
+        cmd_read    = _fops.cmd_read
+        cmd_move    = _fops.cmd_move
+        cmd_copy    = _fops.cmd_copy
+        cmd_delete  = _fops.cmd_delete
+        cmd_rename  = _fops.cmd_rename
+        cmd_list    = _fops.cmd_list
+        cmd_confirm = _fops.cmd_confirm
+        cmd_cancel  = _fops.cmd_cancel
+        FILE_OPS_ENABLED = True
+    except Exception as e:
+        FILE_OPS_ENABLED = False
+        print(f"⚠️ [hermes_file_ops] 로드 실패 (무시): {e}")
+
+    # ── hermes_harness 지연 로드 ───────────────────────────────────────────
+    try:
+        _harn = _load_module('hermes_harness')
+        cmd_harness  = _harn.cmd_harness
+        cmd_hdod     = _harn.cmd_hdod
+        cmd_hstatus  = _harn.cmd_hstatus
+        cmd_hrollback = _harn.cmd_hrollback
+        LOCAL_HARNESS_ENABLED = True
+    except Exception as e:
+        LOCAL_HARNESS_ENABLED = False
+        print(f"⚠️ [hermes_harness] 로드 실패 (무시): {e}")
+
+    # ── Bio-Memory Patch 로드 ─────────────────────────────────────────────
+    try:
+        _mem = _load_module('hermes_memory_patch')
+        _mem.init_bio_memory()
+        cmd_memory        = _mem.cmd_memory
+        cmd_memory_search = _mem.cmd_memory_search
+        cmd_memory_dream  = _mem.cmd_memory_dream
+        cmd_memory_audit  = _mem.cmd_memory_audit
+        BIO_MEM_ENABLED = True
+    except Exception:
+        BIO_MEM_ENABLED = False
+
+    # ── 웹 검색 에이전트 로드 ─────────────────────────────────────────
+    try:
+        _web = _load_module('web_agent_module')
+        web_agent = _web.WebAgentSkills()
+        WEB_AGENT_ENABLED = True
+    except Exception:
+        WEB_AGENT_ENABLED = False
+
+    # ── harness_agent 통합 (단일 봇 통합 핵심) ──────────────────────────
+    # harness_agent.py는 라이브러리 모드로 동작하며,
+    # handle_message() 함수만 import하여 일반 텍스트 메시지 수신 시 호출합니다.
+    HARNESS_AGENT_ENABLED = False
+    harness_handle_message = None
+    harness_auto_heal = None
+    try:
+        _ha = _load_module('harness_agent')
+        harness_handle_message = _ha.handle_message
+        harness_auto_heal = getattr(_ha.sys_mon, 'auto_heal', None)
+        HARNESS_AGENT_ENABLED = True
+        print("✅ [harness_agent] 라이브러리 모드로 정상 연동되었습니다.")
+
+        # 🐛 핵심 수정: hermes_handlers.pyc가 line 279에서 이미 DummyRouter를 복사했으므로
+        # 실제 HybridRouter로 직접 덮어쓰기 (from import는 값을 복사하므로 patch_router만으로 부족)
+        import hybrid_router as _hr
+        _hmod = sys.modules.get('hermes_handlers')
+        if _hmod and hasattr(_hmod, 'router'):
+            _hmod.router = _hr.router
+            print("  └─ hermes_handlers.router → HybridRouter로 교체 완료 🎯", flush=True)
+        else:
+            try:
+                import hermes_handlers as _hh
+                _hh.router = _hr.router
+                print("  └─ hermes_handlers.router → HybridRouter로 교체 완료 (강제 로드) 🎯", flush=True)
+            except Exception as _reload_e:
+                print(f"  ❌ hermes_handlers.router 교체 실패: {_reload_e}", flush=True)
+    except Exception as e:
+        print(f"⚠️ [harness_agent] 연동 실패 (무시): {e}")
+
+    # ── 핸들러 등록 ───────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("menu",     cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("ask",      cmd_ask))
+    app.add_handler(CommandHandler("cove",     cmd_cove))
+    app.add_handler(CommandHandler("web",      cmd_web))
+    app.add_handler(CommandHandler("ingest",   cmd_ingest))
+    app.add_handler(CommandHandler("dreaming", cmd_dreaming))
+    app.add_handler(CommandHandler("exec",     cmd_exec))
+    app.add_handler(CommandHandler("clip",     cmd_clip))
+    app.add_handler(CommandHandler("recent",   cmd_recent))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("goal",     cmd_goal))
+    app.add_handler(CommandHandler("kanban",   cmd_kanban))
+
+    if FILE_OPS_ENABLED:
+        app.add_handler(CommandHandler("create",  cmd_create))
+        app.add_handler(CommandHandler("read",    cmd_read))
+        app.add_handler(CommandHandler("move",    cmd_move))
+        app.add_handler(CommandHandler("copy",    cmd_copy))
+        app.add_handler(CommandHandler("delete",  cmd_delete))
+        app.add_handler(CommandHandler("rename",  cmd_rename))
+        app.add_handler(CommandHandler("list",    cmd_list))
+        app.add_handler(CommandHandler("confirm", cmd_confirm))
+        app.add_handler(CommandHandler("cancel",  cmd_cancel))
+
+    if LOCAL_HARNESS_ENABLED:
+        app.add_handler(CommandHandler("harness",   cmd_harness))
+        app.add_handler(CommandHandler("hdod",      cmd_hdod))
+        app.add_handler(CommandHandler("hstatus",   cmd_hstatus))
+        app.add_handler(CommandHandler("hrollback", cmd_hrollback))
+
+    if BIO_MEM_ENABLED:
+        app.add_handler(CommandHandler("memory",        cmd_memory))
+        app.add_handler(CommandHandler("memory_search", cmd_memory_search))
+        app.add_handler(CommandHandler("memory_dream",  cmd_memory_dream))
+        app.add_handler(CommandHandler("memory_audit",  cmd_memory_audit))
+
+    if WEB_AGENT_ENABLED:
+        app.add_handler(CommandHandler("search",      web_agent.cmd_search))
+        app.add_handler(CommandHandler("readweb",     web_agent.cmd_readweb))
+        app.add_handler(CommandHandler("searchpaper", web_agent.cmd_searchpaper))
+
+    # ── Profile Manager ─────────────────────────────────────────────
+    try:
+        from modules.profile_manager import set_profile as _set_profile, list_profiles as _list_profiles
+        async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            from telegram.constants import ParseMode
+            args = context.args
+            if not args:
+                reply = _list_profiles()
+            else:
+                reply = _set_profile(args[0])
+            await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+        app.add_handler(CommandHandler("profile", cmd_profile))
+    except Exception:
+        pass
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    app.add_handler(CallbackQueryHandler(handle_button_callback))
+    app.add_error_handler(global_error_handler)
+
+    # ── harness_agent auto_heal 백그라운드 루프 등록 ─────────────────────────
+    if HARNESS_AGENT_ENABLED:
+        async def _post_init_harness(application):
+            import asyncio
+            import config as _cfg
+            async def _auto_heal_loop():
+                while True:
+                    try:
+                        import os
+                        _ha_mod = _load_module('harness_agent')
+                        _ha_mod.sys_mon.auto_heal(os.path.join(str(_cfg.SCRIPTS_DIR), "recovery_system.sh"))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(300)
+            asyncio.create_task(_auto_heal_loop())
+
+        _orig_post_init = getattr(app, 'post_init', None)
+        async def _combined_post_init(application):
+            if _orig_post_init:
+                await _orig_post_init(application)
+            await _post_init_harness(application)
+        app.post_init = _combined_post_init
+
+    print("🚀 [Harness V2.5] CoVe 팩트체크 및 자율 제어 헤르메스 관제탑이 정상 가동되었습니다.")
+    print(f"🛡️ [하네스 레이어] ACID 에이전트 제어 하네스 {'활성화' if HARNESS_ENABLED else '비활성화 (모듈 없음)'}")
+
+    # ── 메모리 자동 정리 프로세스 시작 ───────────────────────────────────
+    try:
+        if _MODULES_DIR not in sys.path:
+            sys.path.append(_MODULES_DIR)
+        from graph_memory import MemoryConsolidator
+        consolidator = MemoryConsolidator(idle_threshold_seconds=300)
+        consolidator.start_background()
+        print("🧠 [Memory] 지식 그래프(NetworkX) 자동 정리 백그라운드 모듈 시작됨")
+    except ImportError as e:
+        print(f"⚠️ [Memory] MemoryConsolidator 모듈 로드 실패: {e}")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()

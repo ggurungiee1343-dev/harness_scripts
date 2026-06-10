@@ -1,0 +1,5 @@
+import os, unicodedata
+class AuditEngine:
+    def __init__(self, vault_path="/Users/bluesea/Applications/Mjobsidian"):
+        self.vault_path = vault_path
+    def run_audit(self): return "✅ 지식 베이스 무결성 검사 완료"

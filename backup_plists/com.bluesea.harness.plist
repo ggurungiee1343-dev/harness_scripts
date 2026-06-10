@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bluesea.harness</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>/Users/bluesea/Applications/Mjauto/Scripts/harness_v2.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/harness.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/harness.log</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/bluesea/Applications/Mjauto</string>
+</dict>
+</plist>

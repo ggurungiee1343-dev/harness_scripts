@@ -1,0 +1,161 @@
+"""
+hermes_file_ops.py — Obsidian 파일/폴더 안전 조작 핸들러
+======================================================
+/create, /read, /move, /copy 명령어를 처리합니다.
+"""
+
+import os
+import re
+import shutil
+from pathlib import Path
+from telegram import Update
+from telegram.ext import ContextTypes
+
+# hermes_local 공통 유틸 임포트
+from hermes_local import check_user, secure_path
+
+# ── 경로 정규화 (마크다운 특수문자 제거) ─────────────────────────
+def _sanitize_path(raw: str) -> str:
+    """입력 경로에서 마크다운 특수문자(백틱, 괄호)와 앞뒤 공백 제거."""
+    cleaned = raw
+    cleaned = re.sub(r'[`()]', '', cleaned)   # 백틱, 여는괄호, 닫는괄호 제거
+    cleaned = cleaned.strip()                  # 앞뒤 공백 제거
+    cleaned = cleaned.rstrip('.,')             # 후행 문장부호(. ,) 제거 (앞쪽은 보존)
+    return cleaned
+# ─────────────────────────────────────────────────────────────────
+
+# ── Action Realization Layer (Life-Harness Layer ❸) ────────────────────
+from modules.action_realization_layer import ActionRealizationLayer
+_action_layer = ActionRealizationLayer.get_instance()
+
+
+async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update): return
+    if len(context.args) < 1:
+        await update.message.reply_text("⚠️ 사용법: `/create [파일명] [내용...]`", parse_mode="Markdown")
+        return
+    
+    filename = _sanitize_path(context.args[0])
+    content = " ".join(context.args[1:])
+    
+    # 🔒 Action Realization Layer 검증
+    create_result = _action_layer.validate("file_create", path=filename, content=content)
+    if not create_result.valid:
+        await update.message.reply_text(f"❌ {create_result.message}\n💡 {create_result.suggestion}")
+        return
+    
+    try:
+        file_path = secure_path(f"inbox/{filename}")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        await update.message.reply_text(f"📝 [생성 완료]\n경로: `Mjobsidian/inbox/{file_path.name}`", parse_mode="Markdown")
+    except PermissionError as e:
+        await update.message.reply_text(f"🔒 보안 경고: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 오류 발생: {e}")
+
+
+async def cmd_read(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update): return
+    if len(context.args) < 1:
+        await update.message.reply_text("⚠️ 사용법: `/read [폴더/파일명]`", parse_mode="Markdown")
+        return
+    
+    target = _sanitize_path(' '.join(context.args))
+    
+    # 🔒 Action Realization Layer 검증
+    read_result = _action_layer.validate("file_read", path=target)
+    if not read_result.valid:
+        await update.message.reply_text(f"❌ {read_result.message}\n💡 {read_result.suggestion}")
+        return
+    
+    try:
+        file_path = secure_path(target)
+        if not file_path.exists() or not file_path.is_file():
+            await update.message.reply_text("❌ 파일을 찾을 수 없습니다.")
+            return
+            
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            await update.message.reply_text("⚠️ 텍스트(UTF-8) 형식이 아니거나 손상된 이진 파일입니다.")
+            return
+            
+        if len(text) > 3500:
+            truncated = text[:3500] + "\n\n...(이하 생략 - 파일 크기 초과)..."
+            await update.message.reply_text(f"📖 **{target} 내용 (일부):**\n\n{truncated}")
+        else:
+            await update.message.reply_text(f"📖 **{target} 내용:**\n\n{text if text.strip() else '(빈 파일)'}")
+            
+    except PermissionError as e:
+        await update.message.reply_text(f"🔒 보안 경고: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 오류 발생: {e}")
+
+
+async def cmd_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update): return
+    if len(context.args) < 2:
+        await update.message.reply_text("⚠️ 사용법: `/move [현재폴더/파일명] [이동할폴더]`", parse_mode="Markdown")
+        return
+    
+    src = _sanitize_path(' '.join(context.args[:-1]))
+    dest_folder = _sanitize_path(context.args[-1])
+    
+    # 🔒 Action Realization Layer 검증
+    move_result = _action_layer.validate("file_move_copy", source=src, destination=dest_folder)
+    if not move_result.valid:
+        await update.message.reply_text(f"❌ {move_result.message}\n💡 {move_result.suggestion}")
+        return
+    
+    try:
+        src_path = secure_path(src)
+        if not src_path.exists():
+            await update.message.reply_text("❌ 원본 파일이 존재하지 않습니다.")
+            return
+            
+        dest_dir = secure_path(dest_folder)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / src_path.name
+        
+        shutil.move(str(src_path), str(dest_path))
+        await update.message.reply_text(f"🚚 [이동 완료]\n`{src}` ➔ `{dest_folder}/{src_path.name}`", parse_mode="Markdown")
+    except PermissionError as e:
+        await update.message.reply_text(f"🔒 보안 경고: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 오류 발생: {e}")
+
+
+async def cmd_copy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update): return
+    if len(context.args) < 2:
+        await update.message.reply_text("⚠️ 사용법: `/copy [원본폴더/파일명] [대상폴더/파일명]`", parse_mode="Markdown")
+        return
+    
+    src = _sanitize_path(' '.join(context.args[:-1]))
+    dest = _sanitize_path(context.args[-1])
+    
+    # 🔒 Action Realization Layer 검증
+    copy_result = _action_layer.validate("file_move_copy", source=src, destination=dest)
+    if not copy_result.valid:
+        await update.message.reply_text(f"❌ {copy_result.message}\n💡 {copy_result.suggestion}")
+        return
+    
+    try:
+        src_path = secure_path(src)
+        if not src_path.exists():
+            await update.message.reply_text("❌ 원본 파일이 존재하지 않습니다.")
+            return
+            
+        dest_path = secure_path(dest)
+        if dest_path.is_dir():
+            dest_path = dest_path / src_path.name
+            
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, dest_path)
+        await update.message.reply_text(f"📋 [복사 완료]\n`{src}` ➔ `{dest}`", parse_mode="Markdown")
+    except PermissionError as e:
+        await update.message.reply_text(f"🔒 보안 경고: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 오류 발생: {e}")
