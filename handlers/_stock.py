@@ -23,6 +23,29 @@ from modules.weakness_miner      import get_weakness_miner
 
 logger = logging.getLogger(__name__)
 
+
+async def safe_reply(message, text: str, **kwargs):
+    """Markdown 파싱 실패 시 plain text 자동 폴백 (결함 #4 방어 — 패키지 독립성 유지 위해 로컬 정의)"""
+    try:
+        return await message.reply_text(text, **kwargs)
+    except Exception as e:
+        if 'parse' in str(e).lower() or 'entit' in str(e).lower():
+            kwargs.pop('parse_mode', None)
+            return await message.reply_text(text, **kwargs)
+        raise
+
+
+async def safe_edit(message, text: str, **kwargs):
+    """edit_text용 Markdown 폴백 — safe_reply와 동일 패턴"""
+    try:
+        return await message.edit_text(text, **kwargs)
+    except Exception as e:
+        if 'parse' in str(e).lower() or 'entit' in str(e).lower():
+            kwargs.pop('parse_mode', None)
+            return await message.edit_text(text, **kwargs)
+        raise
+
+
 # ── 기본 설정 (텔레그램으로 /stock config로 변경 가능) ─────────
 DEFAULT_ACCOUNT = 100_000
 DEFAULT_RISK    = 0.01
@@ -144,7 +167,7 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/stock TICKER [account] [risk%]"""
     args = context.args or []
     if not args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "📈 *주식 분석 명령어*\n\n"
             "`/stock NVDA` — 단일 종목 분석\n"
             "`/stock NVDA 50000 0.01` — 계좌 $50K, 1% 리스크\n"
@@ -160,23 +183,23 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     account = float(args[1]) if len(args) > 1 else DEFAULT_ACCOUNT
     risk    = float(args[2]) if len(args) > 2 else DEFAULT_RISK
 
-    msg = await update.message.reply_text(f"⏳ {symbol} 분석 중...")
+    msg = await safe_reply(update.message, f"⏳ {symbol} 분석 중...")
 
     try:
         sc = StockScanner(account_equity=account, risk_pct=risk)
         sig = sc.analyze_single(symbol)
 
         if not sig.get("valid"):
-            await msg.edit_text(f"❌ {symbol}: {sig.get('reason', '오류')}")
+            await safe_edit(msg, f"❌ {symbol}: {sig.get('reason', '오류')}")
             return
 
         text = _format_signal(symbol, sig, show_position=True)
-        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+        await safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
         logger.error(f"/stock 오류: {e}", exc_info=True)
         await get_weakness_miner().record_failure("cmd_stock", str(e))
-        await msg.edit_text(f"❌ 오류: {e}")
+        await safe_edit(msg, f"❌ 오류: {e}")
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,13 +222,39 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cmd_stock(update, context)
             return
 
-    msg = await update.message.reply_text("🔍 NASDAQ 스캔 중... (1~3분 소요)")
+    msg = await safe_reply(update.message, "🔍 NASDAQ 스캔 중... (1~3분 소요)")
 
     try:
         import concurrent.futures, asyncio
         loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            result = await loop.run_in_executor(pool, _scanner.run_scan)
+
+        # 진행 상황 메시지 주기적 업데이트 (30초마다)
+        async def _progress():
+            dots = 1
+            phases = ["시장 필터 확인 중", "종목 데이터 수집 중", "지표 계산 중", "신호 분석 중"]
+            i = 0
+            while True:
+                await asyncio.sleep(30)
+                i = (i + 1) % len(phases)
+                dots = (dots % 3) + 1
+                try:
+                    await safe_edit(msg, f"🔍 {phases[i]}{'.' * dots} (최대 3분)")
+                except Exception:
+                    pass
+
+        progress_task = asyncio.create_task(_progress())
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(pool, _scanner.run_scan),
+                    timeout=210  # 3분 30초 — 초과 시 TimeoutError
+                )
+        except asyncio.TimeoutError:
+            progress_task.cancel()
+            await safe_edit(msg, "⏱ 스캔 타임아웃 (3분 30초 초과)\n네트워크가 느리거나 yfinance 서버 문제일 수 있습니다.\n잠시 후 다시 시도해 주세요.")
+            return
+        finally:
+            progress_task.cancel()
 
         mf  = result["market_filter"]
         det = mf.get("details", {})
@@ -217,7 +266,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"VIX {det.get('vix_current','—')} {_bool_icon(det.get('vix_pass'))}\n"
                 f"섹터 {det.get('breadth_count','—')}/11 {_bool_icon(det.get('breadth_pass'))}"
             )
-            await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+            await safe_edit(msg, text, parse_mode=ParseMode.MARKDOWN)
             return
 
         stats  = result["stats"]
@@ -253,7 +302,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          ("🌱" if s.get("fresh_trend") else "")
                 out += f"• *{sym}*  ${close:,.0f}  {score:.1f}점 {badges}\n"
                 out += f"  └ `/stock {sym}`\n"
-            await msg.edit_text(out.rstrip(), parse_mode=ParseMode.MARKDOWN)
+            await safe_edit(msg, out.rstrip(), parse_mode=ParseMode.MARKDOWN)
             return
 
         # ════════════════════════════════════════════════════════
@@ -364,24 +413,24 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ⬜ Tier4 힌트
         out += f"\n⬜ SEPA 통과 {stats['sepa_pass']}개 → `/scan sepa`\n"
 
-        await msg.edit_text(out.rstrip(), parse_mode=ParseMode.MARKDOWN)
+        await safe_edit(msg, out.rstrip(), parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
         logger.error(f"/scan 오류: {e}", exc_info=True)
         await get_weakness_miner().record_failure("cmd_scan", str(e))
-        await msg.edit_text(f"❌ 스캔 오류: {e}")
+        await safe_edit(msg, f"❌ 스캔 오류: {e}")
 
 
 async def _send_pages(msg, update, pages: list):
     """페이지 분할 발송 유틸"""
-    await msg.edit_text(pages[0], parse_mode=ParseMode.MARKDOWN)
+    await safe_edit(msg, pages[0], parse_mode=ParseMode.MARKDOWN)
     for page in pages[1:]:
-        await update.message.reply_text(page, parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, page, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/market — 시장 필터 현황"""
-    msg = await update.message.reply_text("📡 시장 데이터 수집 중...")
+    msg = await safe_reply(update.message, "📡 시장 데이터 수집 중...")
 
     try:
         from modules.stock_fetcher import StockDataFetcher
@@ -406,10 +455,10 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"*섹터 EMA200 위치*",
         ] + sector_lines
 
-        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await safe_edit(msg, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        await msg.edit_text(f"❌ 오류: {e}")
+        await safe_edit(msg, f"❌ 오류: {e}")
 
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -419,46 +468,46 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args or args[0] == "list":
         wl = _fetcher.watchlist_get()
         if not wl:
-            await update.message.reply_text("관심종목이 없습니다.\n`/watchlist add AAPL`로 추가하세요.")
+            await safe_reply(update.message, "관심종목이 없습니다.\n`/watchlist add AAPL`로 추가하세요.")
             return
         lines = ["📋 *관심종목*\n"]
         for w in wl:
             lines.append(f"• *{w['symbol']}*  ({w['added_at']})  {w.get('notes', '')}")
             lines.append(f"  └ `/stock {w['symbol']}`")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     elif args[0] == "add" and len(args) > 1:
         sym = args[1].upper()
         notes = " ".join(args[2:]) if len(args) > 2 else ""
         _fetcher.watchlist_add(sym, notes)
-        await update.message.reply_text(f"✅ {sym} 관심종목 추가")
+        await safe_reply(update.message, f"✅ {sym} 관심종목 추가")
 
     elif args[0] in ("rm", "remove", "del") and len(args) > 1:
         sym = args[1].upper()
         _fetcher.watchlist_remove(sym)
-        await update.message.reply_text(f"🗑 {sym} 관심종목 삭제")
+        await safe_reply(update.message, f"🗑 {sym} 관심종목 삭제")
 
     elif args[0] == "scan":
-        msg = await update.message.reply_text("🔍 관심종목 스캔 중...")
+        msg = await safe_reply(update.message, "🔍 관심종목 스캔 중...")
         try:
             result = _scanner.scan_watchlist()
             buys   = result.get("buy_signals", [])
             if not buys:
-                await msg.edit_text("관심종목 중 매수 신호 없음")
+                await safe_edit(msg, "관심종목 중 매수 신호 없음")
             else:
                 lines = ["*관심종목 매수 신호*\n"]
                 for s in buys:
                     lines.append(f"🟢 *{s['symbol']}* ${s['close']:,.2f}  {s['alpha_score']:.1f}점")
-                await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+                await safe_edit(msg, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
-            await msg.edit_text(f"❌ 오류: {e}")
+            await safe_edit(msg, f"❌ 오류: {e}")
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/positions — 열린 포지션"""
     pos_list = _fetcher.get_open_positions()
     if not pos_list:
-        await update.message.reply_text("열린 포지션 없음")
+        await safe_reply(update.message, "열린 포지션 없음")
         return
 
     lines = ["📂 *열린 포지션*\n"]
@@ -469,7 +518,7 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  └ `/stock {p['symbol']}`",
             "",
         ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await safe_reply(update.message, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -488,7 +537,7 @@ async def handle_stock_photo(update: Update, context: ContextTypes.DEFAULT_TYPE,
     caption = update.message.caption or ""
     photo   = update.message.photo[-1]  # 최고화질
 
-    msg = await update.message.reply_text("📸 차트 분석 중...")
+    msg = await safe_reply(update.message, "📸 차트 분석 중...")
 
     try:
         # 사진 다운로드
@@ -535,12 +584,12 @@ async def handle_stock_photo(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"캡션: {caption or '없음'}"
             )
 
-        await msg.edit_text(f"📊 차트 분석\n\n{response}")
+        await safe_edit(msg, f"📊 차트 분석\n\n{response}")
 
     except Exception as e:
         logger.error(f"차트 분석 오류: {e}", exc_info=True)
         await get_weakness_miner().record_failure("cmd_chart", str(e))
-        await msg.edit_text(
+        await safe_edit(msg, 
             f"⚠️ 차트 분석 중 오류\n\n"
             f"종목명을 캡션에 써서 다시 보내주시거나\n"
             f"`/stock TICKER`로 분석해드릴게요."
@@ -556,7 +605,7 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args or []
     if len(args) < 3:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "사용법: `/result TICKER 매수가 매도가 [수량] [메모]`\n"
             "예시: `/result CRWD 580 620 5 SEPA진입`",
             parse_mode=ParseMode.MARKDOWN
@@ -598,10 +647,10 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if notes:
             lines.append(f"메모: {notes}")
         lines.append("\n`/backtest` 로 누적 성과 확인")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        await update.message.reply_text(f"❌ 오류: {e}")
+        await safe_reply(update.message, f"❌ 오류: {e}")
 
 
 async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -624,11 +673,11 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "FROM trade_results ORDER BY recorded_at DESC"
             ).fetchall()
     except Exception as e:
-        await update.message.reply_text(f"❌ 데이터 오류: {e}")
+        await safe_reply(update.message, f"❌ 데이터 오류: {e}")
         return
 
     if not rows:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "📊 기록된 매매 없음\n`/result TICKER 매수가 매도가`로 기록하세요."
         )
         return
@@ -663,7 +712,7 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d_str = f" (${dollar:+.0f})" if dollar else ""
         lines.append(f"{icon} {sym} {pnl:+.2f}%{d_str}  {ts[:10]}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await safe_reply(update.message, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 # ════════════════════════════════════════════════════════════════

@@ -18,7 +18,7 @@ class ApprovalHandler:
         parts = text.split()
 
         if len(parts) < 2:
-            return await update.message.reply_text(
+            return await safe_reply(update.message, 
                 "사용법: /tag pending | /tag approve <id> | /tag reject <id>"
             )
 
@@ -27,18 +27,18 @@ class ApprovalHandler:
         if action == 'pending':
             pending = self.tag_linker.list_pending()
             if not pending:
-                return await update.message.reply_text("대기 중인 태그 제안이 없습니다.")
+                return await safe_reply(update.message, "대기 중인 태그 제안이 없습니다.")
 
             lines = ["📌 Pending tag approvals"]
             for item in pending[:20]:
                 lines.append(
                     f"#{item['id']} | {item['tag']} | {item['confidence']:.2f} | {item['file_path']}"
                 )
-            return await update.message.reply_text("\n".join(lines))
+            return await safe_reply(update.message, "\n".join(lines))
 
         if action in ('approve', 'reject'):
             if len(parts) < 3 or not parts[2].isdigit():
-                return await update.message.reply_text(
+                return await safe_reply(update.message, 
                     f"사용법: /tag {action} <id>"
                 )
 
@@ -46,16 +46,16 @@ class ApprovalHandler:
             if action == 'approve':
                 ok = self.tag_linker.approve_tag(approval_id)
                 if ok:
-                    return await update.message.reply_text(f"✅ approval #{approval_id} 승인 완료")
-                return await update.message.reply_text(f"❌ approval #{approval_id}를 찾을 수 없거나 이미 처리됨")
+                    return await safe_reply(update.message, f"✅ approval #{approval_id} 승인 완료")
+                return await safe_reply(update.message, f"❌ approval #{approval_id}를 찾을 수 없거나 이미 처리됨")
 
             if action == 'reject':
                 ok = self.tag_linker.reject_tag(approval_id)
                 if ok:
-                    return await update.message.reply_text(f"🗑️ approval #{approval_id} 거절 완료")
-                return await update.message.reply_text(f"❌ approval #{approval_id}를 찾을 수 없거나 이미 처리됨")
+                    return await safe_reply(update.message, f"🗑️ approval #{approval_id} 거절 완료")
+                return await safe_reply(update.message, f"❌ approval #{approval_id}를 찾을 수 없거나 이미 처리됨")
 
-        return await update.message.reply_text(
+        return await safe_reply(update.message, 
             "알 수 없는 명령입니다. 사용법: /tag pending | /tag approve <id> | /tag reject <id>"
         )
 

@@ -3,7 +3,7 @@ import os
 import re
 from telegram import Update
 from telegram.ext import ContextTypes
-from handlers._base import (router, cove_engine_instance, _audit_engine,
+from handlers._base import (router, cove_engine_instance, _audit_engine, safe_reply, safe_edit,
     logger, add_to_history, _call_llm, _get_mem_info, check_user,
     secure_path, wiki_mgr, IngestEngine, _ingest_llm_wrapper, analyze_url,
     _reply_long, _edit_or_send_long)
@@ -32,7 +32,7 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             '⚠️ URL과 질문을 입력해 주세요. 예: `/web https://example.com 요약해줘`',
             parse_mode='HTML'
         )
@@ -131,4 +131,4 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as e:
         logger.error(f'Recent error: {e}')
         await get_weakness_miner().record_failure("cmd_recent", str(e))
-        await update.message.reply_text(f'❌ 최근 문서 조회 중 오류: {e}')
+        await safe_reply(update.message, f'❌ 최근 문서 조회 중 오류: {e}')

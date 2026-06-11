@@ -6,13 +6,23 @@ import yfinance as yf
 import pandas as pd
 import sqlite3
 import logging
+import json
+import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
+
+# yfinance 네트워크 타임아웃용 curl_cffi 세션 (10초 초과 시 skip)
+try:
+    from curl_cffi import requests as _curl_requests
+    _YF_SESSION = _curl_requests.Session(timeout=10)
+except Exception:
+    _YF_SESSION = None  # curl_cffi 없으면 yfinance 기본 세션 사용
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 CACHE_DB = DATA_DIR / "stock_cache.db"
+MARKET_CACHE_FILE = DATA_DIR / "market_context_cache.json"
 
 # 11개 GICS 섹터 ETF (시장 브레드스 측정용)
 SECTOR_ETFS = {
@@ -115,36 +125,96 @@ class StockDataFetcher:
 
     # ── 가격 데이터 ────────────────────────────────────────────
     def get_ohlcv(self, symbol: str, period: str = "2y") -> pd.DataFrame:
-        """일봉 OHLCV (yfinance, auto_adjust=True)"""
+        """일봉 OHLCV — yf.download() 우선, 실패 시 ticker.history() 폴백, 재시도 2회"""
+        for attempt in range(3):
+            try:
+                # yf.download()는 bulk endpoint라 rate limit에 더 관대함
+                df = yf.download(symbol, period=period, auto_adjust=True,
+                                 progress=False, multi_level_index=False)
+                if df.empty:
+                    raise ValueError("empty")
+                df.index = pd.to_datetime(df.index).tz_localize(None)
+                cols = {c: c.lower() for c in df.columns}
+                df = df.rename(columns=cols)
+                for col in ["open", "high", "low", "close", "volume"]:
+                    if col not in df.columns:
+                        raise ValueError(f"missing col {col}")
+                return df[["open", "high", "low", "close", "volume"]].dropna()
+            except Exception as e:
+                err = str(e)
+                if "Rate" in err or "429" in err or "Too Many" in err:
+                    wait = 30 * (attempt + 1)
+                    logger.warning(f"[{symbol}] Rate limit, {wait}s 대기 후 재시도 ({attempt+1}/3)")
+                    time.sleep(wait)
+                elif attempt < 2:
+                    time.sleep(3)
+                else:
+                    logger.warning(f"[{symbol}] OHLCV 수집 실패: {e}")
+                    return pd.DataFrame()
+        return pd.DataFrame()
+
+    # ── 시장 컨텍스트 (일별 파일 캐시로 Rate Limit 회피) ──────────
+    def _save_market_cache(self, data: dict):
+        """DataFrame dict → JSON 파일 캐시 (today 키 포함)"""
         try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, auto_adjust=True, prepost=False)
-            if df.empty:
-                return pd.DataFrame()
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            df.columns = ["open", "high", "low", "close", "volume"]
-            return df.dropna()
+            serialized = {"date": str(date.today())}
+            for key, df in data.items():
+                serialized[key] = {
+                    "index": [str(i) for i in df.index],
+                    "data": df.to_dict(orient="list"),
+                }
+            MARKET_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            MARKET_CACHE_FILE.write_text(json.dumps(serialized))
         except Exception as e:
-            logger.warning(f"[{symbol}] OHLCV 수집 실패: {e}")
-            return pd.DataFrame()
+            logger.warning(f"시장 캐시 저장 실패: {e}")
+
+    def _load_market_cache(self) -> dict:
+        """오늘 날짜의 캐시가 있으면 dict로 복원, 없으면 {}"""
+        try:
+            if not MARKET_CACHE_FILE.exists():
+                return {}
+            raw = json.loads(MARKET_CACHE_FILE.read_text())
+            if raw.get("date") != str(date.today()):
+                return {}
+            result = {}
+            for key, val in raw.items():
+                if key == "date":
+                    continue
+                idx = pd.to_datetime(val["index"])
+                df = pd.DataFrame(val["data"], index=idx)
+                result[key] = df
+            logger.info("시장 데이터 일별 캐시 로드")
+            return result
+        except Exception as e:
+            logger.warning(f"시장 캐시 로드 실패: {e}")
+            return {}
 
     def get_market_context(self) -> dict:
-        """시장 필터용 데이터 일괄 수집"""
+        """시장 필터용 데이터 일괄 수집 (일별 캐시로 Rate Limit 방지)"""
+        cached = self._load_market_cache()
+        if cached:
+            return cached
+
         data = {}
         # NASDAQ Composite
         df = self.get_ohlcv("^IXIC", period="1y")
         if not df.empty:
             data["nasdaq"] = df
+        time.sleep(1)
         # VIX
         df = self.get_ohlcv("^VIX", period="6mo")
         if not df.empty:
             data["vix"] = df
+        time.sleep(1)
         # 11개 섹터 ETF
         for sector, etf in SECTOR_ETFS.items():
             df = self.get_ohlcv(etf, period="1y")
             if not df.empty:
                 data[f"sector_{etf}"] = df
+            time.sleep(0.5)
+
+        if data:
+            self._save_market_cache(data)
         return data
 
     def get_universe(self) -> list:
@@ -168,7 +238,7 @@ class StockDataFetcher:
                 ))
 
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(symbol, session=_YF_SESSION) if _YF_SESSION else yf.Ticker(symbol)
             info   = ticker.info or {}
 
             # 실적발표일

@@ -3,7 +3,7 @@ import uuid, datetime, shutil
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from handlers._base import (router, cove_engine_instance, _audit_engine,
+from handlers._base import (router, cove_engine_instance, _audit_engine, safe_reply, safe_edit,
     logger, add_to_history, _call_llm, _get_mem_info, check_user,
     history_mgr, PENDING_TASKS, verifier, _reply_long, _edit_or_send_long)
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12,7 +12,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             '⚠️ 질문을 함께 입력해 주세요. 예: `/ask 세종대왕의 업적을 요약해줘`',
             parse_mode='Markdown'
         )
@@ -80,7 +80,7 @@ async def cmd_cove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             '⚠️ 질문을 입력해 주세요. 예: `/cove 이순신 장군의 주요 업적은?`\n'
             '🔄 `devil` 모드: `/cove devil <주장>` — 반론 생성',
             parse_mode='Markdown'
@@ -91,7 +91,7 @@ async def cmd_cove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is_devil = context.args[0].lower() == 'devil'
     if is_devil:
         if len(context.args) < 2:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 '⚠️ 반론 생성 모드입니다. 주장을 입력해 주세요.\n'
                 '예: `/cove devil AI가 인류를 멸망시킬 것이다`',
                 parse_mode='Markdown'
@@ -182,7 +182,7 @@ async def cmd_dreaming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _edit_or_send_long(msg, res, parse_mode='Markdown')
     except Exception as e:
         logger.error(f'Dreaming Error: {e}')
-        await msg.edit_text(f'❌ Dreaming 실행 중 오류 발생: {e}')
+        await safe_edit(msg, f'❌ Dreaming 실행 중 오류 발생: {e}')
 
 async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/clip [내용] - 텍스트를 Clippings 폴더에 .md 파일로 즉시 저장"""
@@ -190,7 +190,7 @@ async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             '⚠️ 사용법: `/clip [저장할 내용]`\n'
             '예: `/clip 양자역학에서 얽힘(entanglement)이란 두 입자의 상태가 서로 연결된 현상을 말한다.`',
             parse_mode='Markdown'
@@ -222,7 +222,7 @@ async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with open(clip_path, 'w', encoding='utf-8') as f:
             f.write(md_content)
 
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             f'📎 **Clipping 저장 완료!**\n'
             f'📁 위치: `Clippings/{filename}`\n'
             f'⏰ {date_str}',
@@ -230,7 +230,7 @@ async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except Exception as e:
         logger.error(f'Clip error: {e}')
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             f'❌ 저장 중 오류 발생: {e}'
         )
 
@@ -248,16 +248,16 @@ async def cmd_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             msg = f"🎯 **현재 설정된 목표:**\n{current_goal}\n\n목표를 새로 설정하려면 `/goal [새 목표]`를 입력하고, 삭제하려면 `/goal clear`를 입력하세요."
         else:
             msg = "⚠️ 현재 설정된 장기 목표가 없습니다.\n목표를 설정하려면 `/goal [목표 내용]`을 입력하세요."
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        await safe_reply(update.message, msg, parse_mode='Markdown')
         return
 
     subcmd = context.args[0].lower()
     if subcmd == 'clear':
         if os.path.exists(goal_file):
             os.remove(goal_file)
-            await update.message.reply_text("🗑️ 현재 설정된 목표가 삭제되었습니다.", parse_mode='Markdown')
+            await safe_reply(update.message, "🗑️ 현재 설정된 목표가 삭제되었습니다.", parse_mode='Markdown')
         else:
-            await update.message.reply_text("⚠️ 삭제할 목표가 없습니다.", parse_mode='Markdown')
+            await safe_reply(update.message, "⚠️ 삭제할 목표가 없습니다.", parse_mode='Markdown')
         return
 
     new_goal = ' '.join(context.args)
@@ -265,10 +265,10 @@ async def cmd_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         os.makedirs(os.path.dirname(goal_file), exist_ok=True)
         with open(goal_file, 'w', encoding='utf-8') as f:
             f.write(new_goal)
-        await update.message.reply_text(f"✅ **새로운 장기 목표가 설정되었습니다.**\n\n🎯 {new_goal}\n\n(오늘 밤 Dreaming 스케줄러가 이 목표의 진척도와 헌법 준수 여부를 평가합니다.)", parse_mode='Markdown')
+        await safe_reply(update.message, f"✅ **새로운 장기 목표가 설정되었습니다.**\n\n🎯 {new_goal}\n\n(오늘 밤 Dreaming 스케줄러가 이 목표의 진척도와 헌법 준수 여부를 평가합니다.)", parse_mode='Markdown')
     except Exception as e:
         logger.error(f'Goal command error: {e}')
-        await update.message.reply_text(f'❌ 목표 설정 중 오류 발생: {e}')
+        await safe_reply(update.message, f'❌ 목표 설정 중 오류 발생: {e}')
 
 async def _cmd_topmem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """🧠 메모리 버튼: 현황 표시 + 캐시 정리(sudo purge) 원클릭"""
@@ -286,11 +286,11 @@ async def _cmd_topmem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton('🧹 캐시 정리 실행 (sudo purge)', callback_data='mem_purge_confirm')
         ]])
-        await update.message.reply_text(report, reply_markup=keyboard, parse_mode='Markdown')
+        await safe_reply(update.message, report, reply_markup=keyboard, parse_mode='Markdown')
 
     except Exception as e:
         logger.error(f'Memory query error: {e}')
-        await update.message.reply_text(f'❌ 메모리 조회 중 오류: {e}')
+        await safe_reply(update.message, f'❌ 메모리 조회 중 오류: {e}')
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -307,11 +307,11 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         result = auto_forget(dry_run=not confirm)
 
         if not result["candidates"]:
-            await update.message.reply_text("✅ Forget 대상이 없습니다. 메모리가 건강합니다.")
+            await safe_reply(update.message, "✅ Forget 대상이 없습니다. 메모리가 건강합니다.")
             return
 
         if confirm:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 f"🧹 <b>Forget 완료</b>\n\n"
                 f"• 제거: {result['removed']}개\n"
                 f"• 유지: {result['remaining']}개\n"
@@ -327,13 +327,13 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     f"    {c['content']}"
                 )
             lines.append(f"\n💡 실행: <code>/memory forget confirm</code>")
-            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            await safe_reply(update.message, "\n".join(lines), parse_mode="HTML")
         return
 
     # /memory health — 정제 상태
     if subcmd == 'health':
         from modules.memory_refinement import get_memory_health
-        await update.message.reply_text(get_memory_health(), parse_mode="HTML")
+        await safe_reply(update.message, get_memory_health(), parse_mode="HTML")
         return
 
     # 자동 백업: L2 episodic_memory.json 수정 전 스냅샷
@@ -401,7 +401,7 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append('')
     lines.append('\U0001f4a1 `/memory_dream` \u2014 Dreaming \uc218\ub3d9 \uc2e4\ud589')
 
-    await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+    await safe_reply(update.message, '\n'.join(lines), parse_mode='Markdown')
 
 
 async def cmd_ask_logic(question: str) -> str:

@@ -13,7 +13,7 @@ logger = logging.getLogger("HermesOrchestrator")
 
 # _get_mem_info는 _base.py에서 lazy import (순환 방지)
 async def _get_mem_info():
-    from handlers._base import _get_mem_info as _fn
+    from handlers._base import _get_mem_info as _fn, safe_reply, safe_edit
     return await _fn()
 
 async def handle_retry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -23,10 +23,10 @@ async def handle_retry_callback(update: Update, context: ContextTypes.DEFAULT_TY
     action = opt.last_failed(user_id)
 
     if not action:
-        await update.message.reply_text("⚠️ 재시도할 실패 작업이 없습니다.")
+        await safe_reply(update.message, "⚠️ 재시도할 실패 작업이 없습니다.")
         return
 
-    await update.message.reply_text(
+    await safe_reply(update.message, 
         f"🔄 <b>마지막 실패 작업 정보</b>\n\n"
         f"작업: <code>{action.action_name}</code>\n"
         f"오류: <code>{(action.error_msg or '')[:100]}</code>\n\n"

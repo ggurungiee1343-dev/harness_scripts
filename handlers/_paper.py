@@ -3,7 +3,7 @@ import os
 import json
 from telegram import Update
 from telegram.ext import ContextTypes
-from handlers._base import (router, cove_engine_instance, _audit_engine,
+from handlers._base import (router, cove_engine_instance, _audit_engine, safe_reply, safe_edit,
     logger, add_to_history, _call_llm, _get_mem_info)
 from index_db import add_paper, get_paper, list_papers, create_bundle
 
@@ -34,7 +34,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from telegram.constants import ParseMode
     args = context.args
     if not args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "📄 **/paper 사용법**\n\n"
             "• `/paper humanize [텍스트]` — 법률/학술 문체 변환\n"
             "• `/paper draft [주제]` — 논문 초안 생성 (개요→초안→문체)\n"
@@ -55,20 +55,20 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if subcmd == 'list':
         papers = list_papers()
         if not papers:
-            await update.message.reply_text("📂 저장된 논문이 없습니다.")
+            await safe_reply(update.message, "📂 저장된 논문이 없습니다.")
             return
         text = _build_paper_table(papers)
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, text, parse_mode=ParseMode.MARKDOWN)
         return
 
     # ── /paper show ────────────────────────────────────────────────
     if subcmd == 'show':
         if len(args) < 2:
-            await update.message.reply_text("사용법: `/paper show [논문ID]`", parse_mode=ParseMode.MARKDOWN)
+            await safe_reply(update.message, "사용법: `/paper show [논문ID]`", parse_mode=ParseMode.MARKDOWN)
             return
         paper = get_paper(args[1])
         if not paper:
-            await update.message.reply_text(f"❌ 논문을 찾을 수 없습니다: `{args[1]}`", parse_mode=ParseMode.MARKDOWN)
+            await safe_reply(update.message, f"❌ 논문을 찾을 수 없습니다: `{args[1]}`", parse_mode=ParseMode.MARKDOWN)
             return
         text = (
             f"📄 **{paper['title']}**\n\n"
@@ -80,14 +80,14 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"**등록일**: {paper.get('created_at', '알 수 없음')}\n\n"
             f"**초록**:\n{paper.get('abstract', '없음')[:500]}"
         )
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, text, parse_mode=ParseMode.MARKDOWN)
         return
 
     # ── /paper bundle ──────────────────────────────────────────────
     if subcmd == 'bundle':
         paper_ids = args[1:]
         if len(paper_ids) < 2:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "📦 **/paper bundle [id1] [id2] ...**\n\n"
                 "번들로 묶을 논문 ID를 2개 이상 입력해주세요.\n"
                 "예: `/paper bundle 1 2 3`",
@@ -107,7 +107,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
         if len(valid_ids) < 2:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "❌ 유효한 논문 ID가 2개 미만입니다. `/paper list`로 ID를 확인하세요.",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -115,7 +115,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         bundle_id = create_bundle(valid_ids)
         if bundle_id:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 f"📦 **번들 생성 완료** (번들#{bundle_id})\n\n"
                 f"묶인 논문: {', '.join(str(i) for i in valid_ids)}\n"
                 f"`/paper save {bundle_id}` — 번들을 마크다운으로 저장\n"
@@ -123,14 +123,14 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
-            await update.message.reply_text("❌ 번들 생성 실패.", parse_mode=ParseMode.MARKDOWN)
+            await safe_reply(update.message, "❌ 번들 생성 실패.", parse_mode=ParseMode.MARKDOWN)
         return
 
     # ── /paper claims ──────────────────────────────────────────────
     if subcmd == 'claims':
         bundle_id = args[1] if len(args) > 1 else ''
         if not bundle_id:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "📋 **/paper claims [번들ID]**\n\n"
                 "주장을 추출할 번들 ID를 입력해주세요.",
                 parse_mode=ParseMode.MARKDOWN
@@ -143,14 +143,14 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             papers = []
 
         if not papers:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 f"❌ 번들#{bundle_id}에 논문이 없습니다.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
         await update.message.reply_chat_action("typing")
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             f"🔍 **번들#{bundle_id} 주장 추출 중...**\n"
             f"대상 논문: {len(papers)}편",
             parse_mode=ParseMode.MARKDOWN
@@ -181,13 +181,13 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         reply = await _call_llm(claims_prompt)
-        await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, reply, parse_mode=ParseMode.MARKDOWN)
         return
 
     # ── /paper compare ────────────────────────────────────────────
     if subcmd == 'compare':
         if len(args) < 3:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "⚖️ **/paper compare [id1] [id2]**\n\n"
                 "비교할 두 논문 ID를 입력해주세요.\n"
                 "예: `/paper compare 1 2`",
@@ -201,14 +201,14 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not paper1 or not paper2:
             not_found = [args[1] if not paper1 else '', args[2] if not paper2 else '']
             not_found = [x for x in not_found if x]
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 f"❌ 찾을 수 없는 논문: {', '.join(not_found)}",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
         await update.message.reply_chat_action("typing")
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             f"⚖️ **논문 비교 중...**\n"
             f"① {paper1['title'][:50]} vs ② {paper2['title'][:50]}",
             parse_mode=ParseMode.MARKDOWN
@@ -237,14 +237,14 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         reply = await _call_llm(compare_prompt)
-        await update.message.reply_text(reply[:3900], parse_mode=ParseMode.MARKDOWN)
+        await safe_reply(update.message, reply[:3900], parse_mode=ParseMode.MARKDOWN)
         return
 
     # ── /paper save ────────────────────────────────────────────────
     if subcmd == 'save':
         bundle_id = args[1] if len(args) > 1 else ''
         if not bundle_id:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "💾 **/paper save [번들ID]**\n\n"
                 "저장할 번들 ID를 입력해주세요.",
                 parse_mode=ParseMode.MARKDOWN
@@ -257,7 +257,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             papers = []
 
         if not papers:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 f"❌ 번들#{bundle_id}에 논문이 없습니다.",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -303,7 +303,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(md_content)
 
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             f"💾 **번들 #{bundle_id} 저장 완료**\n\n"
             f"📄 `20_Research/{file_name}`\n"
             f"논문 {len(papers)}편\n\n"
@@ -316,7 +316,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if subcmd == 'humanize':
         text = ' '.join(args[1:]) if len(args) > 1 else ''
         if not text:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "✍️ **/paper humanize [텍스트]**\n\n"
                 "변환할 텍스트를 입력해주세요.\n"
                 "예: `/paper humanize 이 연구는 AI 알고리즘의 차별적 결과가 현행 평등권 법리로 규율 가능한지 검토한다.`",
@@ -346,7 +346,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         reply = await _call_llm(llm_prompt)
 
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             f"✍️ **학술 문체 변환 완료**\n\n{reply}",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -356,7 +356,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if subcmd == 'draft':
         topic = ' '.join(args[1:]) if len(args) > 1 else ''
         if not topic:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "📝 **/paper draft [주제]**\n\n"
                 "논문 초안을 생성할 주제를 입력해주세요.\n"
                 "예: `/paper draft AI 알고리즘 차별과 평등권 침해에 대한 법적 규율`\n"
@@ -366,7 +366,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         await update.message.reply_chat_action("typing")
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "📝 **논문 초안 생성 중...**\n"
             f"주제: `{topic[:80]}`\n\n"
             "🔍 선행연구 검색 → 개요 구성 → 초안 작성 순으로 진행합니다.\n"
@@ -451,18 +451,18 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         footer = "\n\n---\n💡 **다음 단계**: `/paper humanize [텍스트]`로 특정 부분 문체 보정 | `/searchpaper [키워드]`로 참고문헌 검색"
 
         if len(header + final_draft + footer) <= MAX_LEN:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 header + final_draft + footer,
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 f"📝 **논문 초안** — `{topic[:60]}`\n\n"
                 f"**📋 개요**\n{outline}\n\n"
                 f"_(본문이 길어 나누어 전송합니다 →)_",
                 parse_mode=ParseMode.MARKDOWN
             )
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 f"**✍️ 본문 초안**\n\n{final_draft[:3900]}" + footer,
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -472,7 +472,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if subcmd == 'review':
         doc_path = ' '.join(args[1:]) if len(args) > 1 else ''
         if not doc_path:
-            await update.message.reply_text(
+            await safe_reply(update.message, 
                 "📋 **/paper review [문서 경로 또는 텍스트]**\n\n"
                 "논문 문서를 읽고 학술적 검토를 수행합니다.\n"
                 "예: `/paper review wiki/20_Research/내논문초안.md`\n"
@@ -482,7 +482,7 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         await update.message.reply_chat_action("typing")
-        msg = await update.message.reply_text(
+        msg = await safe_reply(update.message, 
             f"🔍 **논문 검토 중...**\n문서: `{doc_path[:60]}`",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -544,15 +544,15 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         MAX_LEN = 3900
         header = f"📋 **논문 검토 결과** — `{os.path.basename(doc_path) if os.path.isfile(doc_path) else '(직접 입력)'}`\n\n"
         if len(header + reply) <= MAX_LEN:
-            await msg.edit_text(header + reply, parse_mode=ParseMode.MARKDOWN)
+            await safe_edit(msg, header + reply, parse_mode=ParseMode.MARKDOWN)
         else:
-            await msg.edit_text(header + reply[:MAX_LEN], parse_mode=ParseMode.MARKDOWN)
+            await safe_edit(msg, header + reply[:MAX_LEN], parse_mode=ParseMode.MARKDOWN)
             remaining = reply[MAX_LEN:]
             if remaining:
-                await update.message.reply_text(remaining[:MAX_LEN], parse_mode=ParseMode.MARKDOWN)
+                await safe_reply(update.message, remaining[:MAX_LEN], parse_mode=ParseMode.MARKDOWN)
         return
 
-    await update.message.reply_text(
+    await safe_reply(update.message, 
         f"❌ 알 수 없는 하위 명령어: `{subcmd}`\n"
         "사용법: `/paper humanize`, `/paper draft`, `/paper review`, `/paper list`, `/paper show`, `/paper bundle`, `/paper claims`, `/paper compare`, `/paper save`",
         parse_mode=ParseMode.MARKDOWN

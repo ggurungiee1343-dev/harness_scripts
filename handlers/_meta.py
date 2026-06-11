@@ -18,6 +18,7 @@ import logging
 from pathlib import Path
 from telegram import Update
 from telegram.ext import ContextTypes
+from handlers._base import safe_reply, safe_edit
 
 logger = logging.getLogger('HermesOrchestrator')
 
@@ -252,4 +253,4 @@ async def cmd_claude_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"• 크기: {file_size_kb:.1f}KB"
         )
 
-    await update.message.reply_text(msg)
+    await safe_reply(update.message, msg)

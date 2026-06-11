@@ -1,7 +1,7 @@
 """handlers._ui — UI 명령어"""
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
-from handlers._base import (router, cove_engine_instance, _audit_engine,
+from handlers._base import (router, cove_engine_instance, _audit_engine, safe_reply, safe_edit,
     logger, add_to_history, _call_llm, _get_mem_info,
     check_user, _make_keyboard)
 
@@ -24,7 +24,7 @@ async def cmd_verify_harness(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("❌ 취소", callback_data="verify_harness_cancel")]
     ])
 
-    await update.message.reply_text(
+    await safe_reply(update.message, 
         "🔍 **Hermes 구조 건강 자동 진단**\n\n"
         "6개 항목을 측정합니다:\n"
         "• 파일 비대화 (줄 수 기반)\n"
@@ -71,7 +71,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '아래 버튼 메뉴나 명령어를 사용하여 관제를 시작해 주십시오.'
     )
 
-    await update.message.reply_text(
+    await safe_reply(update.message, 
         welcome_text,
         reply_markup=_make_keyboard(),
         parse_mode='HTML'
@@ -175,4 +175,4 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '💡 버튼 메뉴에서도 주요 기능에 바로 접근 가능합니다.'
     )
 
-    await update.message.reply_text(help_text, parse_mode='HTML')
+    await safe_reply(update.message, help_text, parse_mode='HTML')

@@ -4,7 +4,7 @@ import unicodedata
 from telegram import Update
 from telegram.ext import ContextTypes
 from modules.weakness_miner import get_weakness_miner
-from handlers._base import (router, logger, add_to_history, _call_llm,
+from handlers._base import (router, logger, add_to_history, _call_llm, safe_reply, safe_edit,
     check_user, secure_path)
 from hermes_local import BASE_DIR
 
@@ -17,7 +17,7 @@ async def cmd_grill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # or /grill "path/to/doc.md" 긴 질문...
     # or /grill docname (wiki 검색)
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "🔥 **Grill with Docs — 문서 기반 대화**\n\n"
             "명령어: `/grill [문서경로/키워드] [질문]`\n\n"
             "예시:\n"
@@ -38,7 +38,7 @@ async def cmd_grill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         doc_query = args[0]
         question = ' '.join(args[1:])
 
-    msg = await update.message.reply_text(
+    msg = await safe_reply(update.message, 
         f"🔥 **Grill:** `{doc_query}` 검색 중...",
         parse_mode='HTML'
     )
@@ -46,7 +46,7 @@ async def cmd_grill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # 1. 문서 경로 찾기
     doc_path = _resolve_doc_path(doc_query)
     if not doc_path:
-        await msg.edit_text(
+        await safe_edit(msg, 
             f"❌ 문서를 찾을 수 없습니다: `{doc_query}`\n"
             "폴더 경로를 포함해 주세요 (예: `wiki/00_Meta/파일명.md`)",
             parse_mode='HTML'
@@ -58,7 +58,7 @@ async def cmd_grill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with open(doc_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
     except Exception as e:
-        await msg.edit_text(f"❌ 문서 읽기 오류: `{e}`", parse_mode='HTML')
+        await safe_edit(msg, f"❌ 문서 읽기 오류: `{e}`", parse_mode='HTML')
         return
 
     rel_path = os.path.relpath(doc_path, str(BASE_DIR))
@@ -74,7 +74,7 @@ async def cmd_grill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         truncated = False
         doc_section = content
 
-    await msg.edit_text(
+    await safe_edit(msg, 
         f"🔥 **Grill:** `{rel_path}` ({file_size_kb:.0f}KB)\n"
         f"💬 {question}",
         parse_mode='HTML'
@@ -109,7 +109,7 @@ async def cmd_grill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"💬 `{question}`"
     )
 
-    await msg.edit_text(result, parse_mode='HTML')
+    await safe_edit(msg, result, parse_mode='HTML')
 
     await add_to_history("assistant",
         f"[Grill] {rel_path} ({file_size_kb:.0f}KB): {question[:60]}..."

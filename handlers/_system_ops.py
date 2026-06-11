@@ -2,7 +2,7 @@
 import os, subprocess, asyncio
 from telegram import Update
 from telegram.ext import ContextTypes
-from handlers._base import (router, logger, add_to_history, _call_llm,
+from handlers._base import (router, logger, add_to_history, _call_llm, safe_reply, safe_edit,
     _get_mem_info, check_user, BASE_DIR, _reply_long)
 
 async def cmd_handoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -16,13 +16,13 @@ async def cmd_handoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             list_handoffs, delete_handoff
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ 핸드오프 모듈 로드 실패: {e}")
+        await safe_reply(update.message, f"❌ 핸드오프 모듈 로드 실패: {e}")
         return
 
     if not context.args or context.args[0] == "list":
         handoffs = list_handoffs()
         if not handoffs:
-            await update.message.reply_text("📭 저장된 핸드오프가 없습니다.")
+            await safe_reply(update.message, "📭 저장된 핸드오프가 없습니다.")
             return
         lines = ["**📋 핸드오프 목록**\n"]
         for h in handoffs:
@@ -30,12 +30,12 @@ async def cmd_handoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"- `{h['session_id'][:24]}` | {h['title'] or '(제목 없음)'} | "
                 f"{h['system_mode'] or '-'} | {h['updated_at'][:16]}"
             )
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        await safe_reply(update.message, "\n".join(lines), parse_mode='HTML')
 
     elif context.args[0] == "latest":
         h = get_latest_handoff()
         if not h:
-            await update.message.reply_text("📭 저장된 핸드오프가 없습니다.")
+            await safe_reply(update.message, "📭 저장된 핸드오프가 없습니다.")
             return
         lines = [
             f"**📌 최근 핸드오프**",
@@ -48,7 +48,7 @@ async def cmd_handoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             lines.append(f"\n**요약:**\n{h['summary'][:500]}")
         if h.get("messages"):
             lines.append(f"\n**메시지:** {len(h['messages'])}개")
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        await safe_reply(update.message, "\n".join(lines), parse_mode='HTML')
 
     elif context.args[0] == "save":
         session_id = context.args[1] if len(context.args) > 1 else "manual_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -59,19 +59,19 @@ async def cmd_handoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             summary=f"수동 핸드오프 저장. 시간: {datetime.now().isoformat(timespec='seconds')}",
             system_mode=get_current_mode(),
         )
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             f"✅ 핸드오프 저장 완료\n세션: `{session_id}`\nID: `{h_id}`",
             parse_mode='HTML'
         )
 
     elif context.args[0] == "load":
         if len(context.args) < 2:
-            await update.message.reply_text("⚠️ 세션 ID를 입력하세요: `/handoff load <session_id>`")
+            await safe_reply(update.message, "⚠️ 세션 ID를 입력하세요: `/handoff load <session_id>`")
             return
         session_id = context.args[1]
         h = load_handoff(session_id=session_id)
         if not h:
-            await update.message.reply_text(f"⚠️ `{session_id}` 핸드오프를 찾을 수 없습니다.")
+            await safe_reply(update.message, f"⚠️ `{session_id}` 핸드오프를 찾을 수 없습니다.")
             return
         lines = [
             f"**📂 핸드오프 로드**",
@@ -86,19 +86,19 @@ async def cmd_handoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 content = msg["content"][:100]
                 icon = "🧑" if msg["role"] == "user" else "🤖"
                 lines.append(f"{icon} {content}")
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        await safe_reply(update.message, "\n".join(lines), parse_mode='HTML')
 
     elif context.args[0] == "delete":
         if len(context.args) < 2:
-            await update.message.reply_text("⚠️ 삭제할 세션 ID를 입력하세요: `/handoff delete <session_id>`")
+            await safe_reply(update.message, "⚠️ 삭제할 세션 ID를 입력하세요: `/handoff delete <session_id>`")
             return
         ok = delete_handoff(session_id=context.args[1])
         if ok:
-            await update.message.reply_text(f"✅ 핸드오프 삭제 완료: `{context.args[1]}`", parse_mode='HTML')
+            await safe_reply(update.message, f"✅ 핸드오프 삭제 완료: `{context.args[1]}`", parse_mode='HTML')
         else:
-            await update.message.reply_text(f"⚠️ `{context.args[1]}` 핸드오프를 찾을 수 없습니다.")
+            await safe_reply(update.message, f"⚠️ `{context.args[1]}` 핸드오프를 찾을 수 없습니다.")
     else:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             f"⚠️ 알 수 없는 액션: `{context.args[0]}`\n"
             f"사용법: `/handoff [list|latest|save|load|delete]`",
             parse_mode='HTML'
@@ -111,7 +111,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "🔍 **FTS5 전문 검색**\n\n"
             "사용법: `/search <질의어>`\n"
             "예: `/search 모델 전환`\n"
@@ -124,17 +124,17 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         from modules.dialectic_layer import search_all, rebuild_index
     except Exception as e:
-        await update.message.reply_text(f"❌ FTS5 모듈 로드 실패: {e}")
+        await safe_reply(update.message, f"❌ FTS5 모듈 로드 실패: {e}")
         return
 
     if query == "--rebuild":
         rebuild_index()
-        await update.message.reply_text("✅ FTS5 인덱스 재구축 완료")
+        await safe_reply(update.message, "✅ FTS5 인덱스 재구축 완료")
         return
 
     results = search_all(query, limit=5)
     if not results:
-        await update.message.reply_text(f"🔍 `{query}` 검색 결과가 없습니다.")
+        await safe_reply(update.message, f"🔍 `{query}` 검색 결과가 없습니다.")
         return
 
     source_icons = {"summaries": "📝", "decisions": "⚖️", "handoffs": "📌"}
@@ -156,7 +156,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if id_val:
             lines.append(f"   `{id_val[:32]}`")
 
-    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+    await safe_reply(update.message, "\n".join(lines), parse_mode='HTML')
 
 
 cmd_fs = cmd_search  # /fs alias for FTS5 search
@@ -172,13 +172,13 @@ async def cmd_restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     BOT_PLIST = Path.home() / "Library/LaunchAgents/com.hermes.bot.plist"
     
-    msg = await update.message.reply_text("🔄 <b>Bot 재시작 진행 중...</b>", parse_mode='HTML')
+    msg = await safe_reply(update.message, "🔄 <b>Bot 재시작 진행 중...</b>", parse_mode='HTML')
     
     if not BOT_PLIST.is_file():
-        await msg.edit_text(f"❌ 에러: {BOT_PLIST} 를 찾을 수 없습니다.")
+        await safe_edit(msg, f"❌ 에러: {BOT_PLIST} 를 찾을 수 없습니다.")
         return
 
-    await msg.edit_text("🔁 <b>Bot 재시작 명령 전송됨</b>\nlaunchctl unload / load 명령을 실행합니다.", parse_mode='HTML')
+    await safe_edit(msg, "🔁 <b>Bot 재시작 명령 전송됨</b>\nlaunchctl unload / load 명령을 실행합니다.", parse_mode='HTML')
 
     # 봇이 죽기 전에 응답을 먼저 보내고 재시작 실행
     import asyncio

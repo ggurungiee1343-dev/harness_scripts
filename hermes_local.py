@@ -13,6 +13,8 @@ import fcntl
 import atexit
 import importlib
 import subprocess
+import signal
+import time
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -217,18 +219,44 @@ def _run_end_hook():
     except Exception: pass
 
 
+def _ensure_single_instance():
+    """PID 파일 기반 단일 인스턴스 보장.
+    구 프로세스가 살아있으면 SIGTERM 후 최대 5초 대기 → 자동 교체.
+    수동 개입 없이 항상 최신 인스턴스만 실행됨.
+    """
+    PID_FILE = Path.home() / '.hermes' / 'hermes_local.pid'
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    my_pid = os.getpid()
+
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            if old_pid != my_pid:
+                try:
+                    os.kill(old_pid, 0)  # 살아있는지 확인
+                    print(f'🔄 구 인스턴스(PID {old_pid}) 종료 중...')
+                    os.kill(old_pid, signal.SIGTERM)
+                    for _ in range(50):  # 최대 5초 대기
+                        time.sleep(0.1)
+                        try:
+                            os.kill(old_pid, 0)
+                        except ProcessLookupError:
+                            break
+                    else:
+                        os.kill(old_pid, signal.SIGKILL)
+                        time.sleep(0.5)
+                    print(f'✅ 구 인스턴스 종료 완료')
+                except ProcessLookupError:
+                    pass  # 이미 죽어있음 — 정상
+        except (ValueError, OSError):
+            pass
+
+    PID_FILE.write_text(str(my_pid))
+    atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
+
+
 def main():
-    LOCK_FILE = Path.home() / '.hermes' / 'hermes_local.lock'
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lock_fp = open(LOCK_FILE, 'w')
-
-    try:
-        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print('⚠️ 다른 hermes_local 인스턴스가 이미 실행 중입니다. 종료합니다.')
-        sys.exit(0)
-
-    atexit.register(lambda fp=lock_fp: (fcntl.flock(fp, fcntl.LOCK_UN), fp.close()))
+    _ensure_single_instance()
     atexit.register(_run_end_hook)
 
     if not TOKEN: sys.exit(1)

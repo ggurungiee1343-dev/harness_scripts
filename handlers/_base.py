@@ -123,6 +123,28 @@ async def _get_mem_info() -> dict:
     }
 
 
+async def safe_reply(message, text: str, **kwargs):
+    """Markdown 파싱 실패 시 plain text로 자동 폴백하는 안전 전송 헬퍼 (결함 #4 방어)"""
+    try:
+        return await message.reply_text(text, **kwargs)
+    except Exception as e:
+        if 'parse' in str(e).lower() or 'entit' in str(e).lower():
+            kwargs.pop('parse_mode', None)
+            return await message.reply_text(text, **kwargs)
+        raise
+
+
+async def safe_edit(message, text: str, **kwargs):
+    """edit_text용 Markdown 폴백 헬퍼 — safe_reply와 동일 패턴"""
+    try:
+        return await message.edit_text(text, **kwargs)
+    except Exception as e:
+        if 'parse' in str(e).lower() or 'entit' in str(e).lower():
+            kwargs.pop('parse_mode', None)
+            return await message.edit_text(text, **kwargs)
+        raise
+
+
 # 텔레그램 메시지 길이 제한 (4096 UTF-8 문자)
 _TG_MSG_LIMIT = 3800
 

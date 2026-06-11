@@ -261,6 +261,28 @@ def hybrid_recall(query: str, top_k: int = 5) -> str:
     except Exception as e:
         logger.warning(f"[MemRefine] FTS5 검색 실패: {e}")
 
+    # 3. semantic_index.db FTS5 (00_Meta 위키 벡터 DB)
+    try:
+        if _SEMANTIC_DB.exists():
+            import sqlite3, re as _re
+            conn = sqlite3.connect(str(_SEMANTIC_DB))
+            # FTS5 MATCH 쿼리: 단어 분리 후 OR 검색
+            words = [w for w in _re.split(r'\s+', query.strip()) if len(w) >= 2][:6]
+            if words:
+                fts_query = " OR ".join(words)
+                rows = conn.execute(
+                    "SELECT path, snippet(fts_docs, 1, '', '', '...', 20) FROM fts_docs WHERE fts_docs MATCH ? LIMIT 3",
+                    (fts_query,)
+                ).fetchall()
+                if rows:
+                    parts.append("🗂 [시맨틱 인덱스]")
+                    for path, snippet in rows:
+                        doc = path.split("/")[-1] if path else "?"
+                        parts.append(f"  · [{doc}] {snippet[:200]}")
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[MemRefine] semantic_index 검색 실패: {e}")
+
     if not parts:
         return ""
 

@@ -21,7 +21,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from handlers._base import (
     router, cove_engine_instance, _audit_engine,
-    logger, add_to_history, _call_llm, _get_mem_info, check_user
+    logger, add_to_history, _call_llm, _get_mem_info, check_user,
+    safe_reply, safe_edit
 )
 
 # ── 상수 ────────────────────────────────────────────────────
@@ -167,7 +168,7 @@ async def cmd_orchestrate(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "🤖 **Multi-Agent Orchestrator**\n\n"
             "복잡한 목표를 여러 전문 에이전트로 분해하여 병렬 처리합니다.\n\n"
             "사용법:\n"
@@ -188,23 +189,23 @@ async def cmd_orchestrate(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # 활성 루프 대시보드 (완료 포함)
         dashboard = mayor.dashboard(include_done=True)
         mayor.prune_old()  # 오래된 완료 항목 정리
-        await update.message.reply_text(dashboard, parse_mode='Markdown')
+        await safe_reply(update.message, dashboard, parse_mode='Markdown')
         return
 
     # 상태 확인
     if goal.lower() == "status":
         if not _active_orchestrations:
-            await update.message.reply_text("📋 현재 실행 중인 오케스트레이션이 없습니다.")
+            await safe_reply(update.message, "📋 현재 실행 중인 오케스트레이션이 없습니다.")
         else:
             lines = ["📋 **실행 중인 오케스트레이션:**\n"]
             for tid, info in list(_active_orchestrations.items()):
                 icon = "🔄" if info["status"] == "running" else "✅" if info["status"] == "done" else "❌"
                 lines.append(f"{icon} `{tid}`: {info.get('goal', '?')[:60]} — {info['status']}")
-            await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+            await safe_reply(update.message, "\n".join(lines), parse_mode='Markdown')
         return
 
     task_id = str(uuid.uuid4())[:8]
-    msg = await update.message.reply_text(
+    msg = await safe_reply(update.message, 
         f"🤖 **Multi-Agent Orchestrator {VERSION}**\n\n"
         f"🎯 **목표**: {goal}\n\n"
         f"**① 분해 중...** 🤔\n"
@@ -225,7 +226,7 @@ async def cmd_orchestrate(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     _active_orchestrations[task_id]["subtasks"] = subtasks
 
     progress_bar = _format_progress_bar(0, n_sub)
-    await msg.edit_text(
+    await safe_edit(msg, 
         f"🤖 **Multi-Agent Orchestrator {VERSION}**\n\n"
         f"🎯 **목표**: {goal}\n\n"
         f"**② {n_sub}개 하위 작업 병렬 실행 중...** 🔄\n\n"
@@ -245,7 +246,7 @@ async def cmd_orchestrate(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     success_count = sum(1 for r in sub_results if r["status"] == "success")
     progress_bar = _format_progress_bar(success_count, n_sub)
 
-    await msg.edit_text(
+    await safe_edit(msg, 
         f"🤖 **Multi-Agent Orchestrator {VERSION}**\n\n"
         f"🎯 **목표**: {goal}\n\n"
         f"**③ 결과 합성 중...** 🔄\n\n"
@@ -288,8 +289,8 @@ async def cmd_orchestrate(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     try:
-        await msg.edit_text(final_text[:4096], parse_mode='Markdown')
+        await safe_edit(msg, final_text[:4096], parse_mode='Markdown')
     except Exception:
-        await msg.edit_text(final_text[:4096])
+        await safe_edit(msg, final_text[:4096])
 
     logger.info(f"🤖 [Orchestrator] 완료: {task_id} — {n_sub}개 작업, {total_duration:.1f}s 총")

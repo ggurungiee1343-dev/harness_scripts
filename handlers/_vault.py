@@ -4,7 +4,7 @@ import re
 import datetime
 from telegram import Update
 from telegram.ext import ContextTypes
-from handlers._base import (router, logger, add_to_history, _call_llm,
+from handlers._base import (router, logger, add_to_history, _call_llm, safe_reply, safe_edit,
     check_user)
 from modules.vault_scanner import scan_vault, calculate_similarities, write_report
 from modules.weakness_miner import get_weakness_miner
@@ -32,7 +32,7 @@ async def cmd_vault(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif subcmd == 'graph':
         await _vault_graph(update, context)
     else:
-        await update.message.reply_text(
+        await safe_reply(update.message, 
             "📦 **Vault 진단 명령어**\n\n"
             "• `/vault check` — 종합 정합성 진단 (캐시/프론트매터/중복)\n"
             "• `/vault duplicates` — 중복 문서 상세 스캔\n"
@@ -42,7 +42,7 @@ async def cmd_vault(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _vault_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """종합 정합성 진단"""
-    msg = await update.message.reply_text(
+    msg = await safe_reply(update.message, 
         "🔍 **Vault 정합성 진단 중...** (캐시/프론트매터/중복)",
         parse_mode='HTML'
     )
@@ -208,7 +208,7 @@ async def _vault_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "\n\n`/vault duplicates`로 중복 문서 상세 확인 · `/vault graph`로 그래프 전체 분석"
     )
 
-    await msg.edit_text(result, parse_mode='HTML')
+    await safe_edit(msg, result, parse_mode='HTML')
 
     # 진단 결과 히스토리 기록
     hist_parts = [f"[Vault Check] {len(issues)}개 이슈, {total_md}개 문서, {total_mb:.1f}MB"]
@@ -219,7 +219,7 @@ async def _vault_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _vault_duplicates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """중복 문서 상세 스캔"""
-    msg = await update.message.reply_text(
+    msg = await safe_reply(update.message, 
         "🔍 **Vault 중복 문서 스캔 중...** (TF-IDF 분석)",
         parse_mode='HTML'
     )
@@ -229,7 +229,7 @@ async def _vault_duplicates(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         pairs = calculate_similarities(docs)
 
         if not pairs:
-            await msg.edit_text(
+            await safe_edit(msg, 
                 "✅ **중복 문서 없음** — 40% 이상 유사한 문서가 없습니다.",
                 parse_mode='HTML'
             )
@@ -262,15 +262,15 @@ async def _vault_duplicates(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # 보고서 파일 생성
         write_report(pairs)
 
-        await msg.edit_text(result, parse_mode='HTML')
+        await safe_edit(msg, result, parse_mode='HTML')
 
     except Exception as e:
         await get_weakness_miner().record_failure("cmd_vault_duplicates", str(e))
-        await msg.edit_text(f"❌ 중복 스캔 오류: `{e}`", parse_mode='HTML')
+        await safe_edit(msg, f"❌ 중복 스캔 오류: `{e}`", parse_mode='HTML')
 
 
 async def _vault_graph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text(
+    msg = await safe_reply(update.message, 
         "🕸️ **Graphify 그래프 분석 중...** (문서 간 연결 추출)",
         parse_mode='HTML'
     )
@@ -292,10 +292,10 @@ async def _vault_graph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )]
 
         if not files:
-            await msg.edit_text("❌ 분석할 `.md` 파일이 없습니다.", parse_mode='HTML')
+            await safe_edit(msg, "❌ 분석할 `.md` 파일이 없습니다.", parse_mode='HTML')
             return
 
-        await msg.edit_text(
+        await safe_edit(msg, 
             f"🕸️ **Graphify 분석 중...** ({len(files)}개 파일)\n"
             f"└─ 추출(extract) → 그래프(build) → 분석(analyze)",
             parse_mode='HTML'
@@ -359,14 +359,14 @@ async def _vault_graph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             + f"{NL}> 💡 `/vault check`로 전체 진단 · `wiki/`내 모든 .md 대상"
         )
 
-        await msg.edit_text(result, parse_mode='HTML')
+        await safe_edit(msg, result, parse_mode='HTML')
         await add_to_history("assistant",
             f"[Vault Graph] {n_nodes}노드 {n_edges}엣지, {orphan_count}고립, {len(gods)}허브"
         )
 
     except ImportError:
         NL = "\n"
-        await msg.edit_text(
+        await safe_edit(msg, 
             f"❌ **Graphify 패키지가 설치되지 않았습니다.**{NL}{NL}"
             f"설치: `pip install graphifyy`{NL}"
             f"이 명령어를 사용하려면 pip 환경에 graphifyy 패키지가 필요합니다.",
@@ -374,4 +374,4 @@ async def _vault_graph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     except Exception as e:
         await get_weakness_miner().record_failure("cmd_vault_graph", str(e))
-        await msg.edit_text(f"❌ 그래프 분석 오류: `{e}`", parse_mode='HTML')
+        await safe_edit(msg, f"❌ 그래프 분석 오류: `{e}`", parse_mode='HTML')
