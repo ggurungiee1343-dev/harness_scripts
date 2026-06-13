@@ -1,12 +1,20 @@
 """
-Memory Refinement Engine v1.0 (Phase 2)
-bio_memory_engine.py(Lock Stack)를 건드리지 않고 4대 갭을 해결하는 래퍼 모듈.
+Memory Refinement Engine v2.0 (Phase 3)
+bio_memory_engine.py 위에서 동작하는 메모리 품질 관리 레이어.
 
 해결 갭:
   1. Forget 정책 부재 → auto_forget()
   2. Update 충돌 감지 → check_conflict()
   3. Writer self-question → should_store()
   4. Retrieval 품질 → hybrid_recall()
+  5. [NEW] SAGE Novelty Gate → novelty_score() / is_novel_enough()
+  6. [NEW] Model Collapse 다양성 모니터 → diversity_check()
+
+참조 논문:
+  - SAGE (2605.30711): 메모리 쓰기 전 novelty gate로 품질·비용 최적화
+  - Bi-Temporal Memory Engine (2606.09900): 컨텍스트 압축 + 선택적 보존
+  - Model Collapse (Oxford 2305.17493): LLM 자기 참조 피드백 루프 방어
+  - Observability-Safe Memory Retention (2606.10616): 접근 빈도 기반 보존 정책
 """
 
 import json
@@ -31,6 +39,16 @@ STORE_IMPORTANCE_FLOOR = 3.0        # 중요도 3.0 미만이면 저장 보류
 STORE_DECAY_DAYS = 7                # "7일 후에도 쓸모있나?" 기준
 CONFLICT_KEYWORD_OVERLAP = 2        # 키워드 2개 이상 겹치면 충돌 후보
 
+# ── SAGE Novelty Gate 설정 (2605.30711) ──────────────────────────────
+NOVELTY_SIMILARITY_THRESHOLD = 0.85  # 기존 에피소드와 이 이상 유사하면 중복으로 간주
+NOVELTY_KEYWORD_OVERLAP_MAX = 4      # 키워드 4개 이상 겹치면 중복 후보
+NOVELTY_FORCE_WRITE_DIFF_THRESHOLD = 0.3  # 유사하지만 결과가 다르면 강제 저장 (MMPO 2605.30159)
+
+# ── Model Collapse 다양성 모니터 설정 (Oxford 2305.17493) ───────────────
+DIVERSITY_MIN_BIGRAM_RATIO = 0.3    # 고유 bigram 비율이 이 미만이면 다양성 저하 경고
+DIVERSITY_SAMPLE_SIZE = 50          # 최근 N개 에피소드로 다양성 계산
+DIVERSITY_HUMAN_MIN_RATIO = 0.30    # human 출처 에피소드 최소 비율 (30% 미만이면 경고)
+
 
 # ── JSON 유틸 ────────────────────────────────────────────────────
 def _load_json(path: Path) -> dict:
@@ -46,6 +64,166 @@ def _save_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)  # atomic write
+
+
+# ══════════════════════════════════════════════════════════════════
+# 5. SAGE Novelty Gate — novelty_score() / is_novel_enough()
+# ══════════════════════════════════════════════════════════════════
+
+def novelty_score(text: str, role: str = "user") -> float:
+    """
+    새 텍스트가 기존 L2 에피소드 대비 얼마나 새로운지 점수 반환 (0.0~1.0).
+
+    1.0 = 완전히 새로운 내용, 0.0 = 기존과 완전 동일.
+
+    SAGE (2605.30711): novelty gate로 메모리 쓰기 품질·비용 최적화.
+    Bi-Temporal (2606.09900): "메모리 = 한뜸" — 진짜 새로운 것만 저장.
+    """
+    from modules.bio_memory_engine import ImportanceScorer
+    l2 = _load_json(_L2_PATH)
+    episodes = l2.get("episodes", [])
+    if not episodes:
+        return 1.0  # 에피소드 없으면 무조건 새로움
+
+    new_kws = set(ImportanceScorer.extract_keywords(text, max_kw=8))
+    if not new_kws:
+        return 0.5  # 키워드 없으면 중립
+
+    # 같은 source(role) 에피소드와만 비교 — human/llm 교차 비교 방지
+    same_source = [ep for ep in episodes if ep.get("source", "human") == ("human" if role == "user" else "llm")]
+    compare_pool = same_source[-30:] if same_source else episodes[-30:]  # 최근 30개
+
+    max_overlap_ratio = 0.0
+    for ep in compare_pool:
+        ep_kws = set(ep.get("keywords", []))
+        if not ep_kws:
+            continue
+        overlap = len(new_kws & ep_kws)
+        ratio = overlap / max(len(new_kws), len(ep_kws))
+        max_overlap_ratio = max(max_overlap_ratio, ratio)
+
+    return round(1.0 - max_overlap_ratio, 3)
+
+
+def is_novel_enough(text: str, role: str = "user", force_if_different_outcome: bool = False) -> tuple:
+    """
+    SAGE Novelty Gate: 저장할 만큼 새로운지 판단.
+
+    Args:
+        text: 저장 후보 텍스트
+        role: "user" | "assistant"
+        force_if_different_outcome: True면 유사해도 결과가 다르면 강제 저장 (MMPO 원칙)
+
+    Returns:
+        (is_novel: bool, score: float, reason: str)
+    """
+    score = novelty_score(text, role)
+
+    if score >= (1.0 - NOVELTY_SIMILARITY_THRESHOLD):
+        return True, score, f"신규 콘텐츠 (novelty {score:.2f})"
+
+    # 유사하지만 결과가 다른 경우 강제 저장 (MMPO 2605.30159: belief clarity)
+    if force_if_different_outcome and score >= NOVELTY_FORCE_WRITE_DIFF_THRESHOLD:
+        return True, score, f"유사하나 결과 상이 → 강제 저장 (MMPO원칙, novelty {score:.2f})"
+
+    return False, score, f"중복 감지 — novelty {score:.2f} < {1.0 - NOVELTY_SIMILARITY_THRESHOLD:.2f}"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 6. Model Collapse 다양성 모니터 — diversity_check()
+# ══════════════════════════════════════════════════════════════════
+
+def diversity_check() -> Dict:
+    """
+    최근 N개 에피소드의 응답 다양성 지수 측정.
+
+    Model Collapse (Oxford 2305.17493): 피드백 루프로 꼬리 분포 소멸 감지.
+    - bigram 다양성 비율 (unique bigrams / total bigrams)
+    - human/llm 출처 비율
+    - 반복 패턴 감지
+
+    Returns:
+        {
+            "bigram_diversity": float,  # 0~1, 낮을수록 단조화
+            "human_ratio": float,       # human 출처 비율
+            "llm_ratio": float,
+            "warnings": [str],
+            "status": "healthy"|"warning"|"critical"
+        }
+    """
+    l2 = _load_json(_L2_PATH)
+    episodes = l2.get("episodes", [])
+    recent = episodes[-DIVERSITY_SAMPLE_SIZE:] if len(episodes) >= DIVERSITY_SAMPLE_SIZE else episodes
+
+    if not recent:
+        return {"bigram_diversity": 1.0, "human_ratio": 1.0, "llm_ratio": 0.0,
+                "warnings": [], "status": "healthy", "sample_size": 0}
+
+    # bigram 다양성
+    all_bigrams = []
+    for ep in recent:
+        content = ep.get("content", "")
+        words = content.split()
+        bigrams = [f"{words[i]}_{words[i+1]}" for i in range(len(words) - 1)]
+        all_bigrams.extend(bigrams)
+
+    bigram_diversity = len(set(all_bigrams)) / max(len(all_bigrams), 1)
+
+    # 출처 비율
+    human_count = sum(1 for ep in recent if ep.get("source", "human") == "human")
+    llm_count = len(recent) - human_count
+    human_ratio = human_count / len(recent)
+    llm_ratio = llm_count / len(recent)
+
+    # 경고 생성
+    warnings = []
+    if bigram_diversity < DIVERSITY_MIN_BIGRAM_RATIO:
+        warnings.append(f"bigram 다양성 {bigram_diversity:.2f} < {DIVERSITY_MIN_BIGRAM_RATIO} — 응답 단조화 진행 중")
+    if human_ratio < DIVERSITY_HUMAN_MIN_RATIO:
+        warnings.append(f"human 출처 비율 {human_ratio:.0%} < {DIVERSITY_HUMAN_MIN_RATIO:.0%} — LLM 자기참조 루프 위험")
+    if llm_ratio > 0.8:
+        warnings.append(f"LLM 응답이 {llm_ratio:.0%} 점유 — Model Collapse 위험 높음")
+
+    # 반복 구문 감지 (LLM 응답에서 흔히 발생)
+    llm_eps = [ep for ep in recent if ep.get("source") == "llm"]
+    if llm_eps:
+        first_words = [ep.get("content", "")[:30] for ep in llm_eps]
+        if len(set(first_words)) / max(len(first_words), 1) < 0.5:
+            warnings.append("LLM 응답 시작 패턴 반복 감지 — 고정관념화 징후")
+
+    if not warnings:
+        status = "healthy"
+    elif len(warnings) == 1:
+        status = "warning"
+    else:
+        status = "critical"
+
+    return {
+        "bigram_diversity": round(bigram_diversity, 3),
+        "human_ratio": round(human_ratio, 3),
+        "llm_ratio": round(llm_ratio, 3),
+        "sample_size": len(recent),
+        "warnings": warnings,
+        "status": status,
+    }
+
+
+def get_diversity_report() -> str:
+    """diversity_check() 결과를 텔레그램용 텍스트로 반환."""
+    d = diversity_check()
+    status_icon = {"healthy": "✅", "warning": "⚠️", "critical": "🔴"}.get(d["status"], "❓")
+    lines = [
+        f"{status_icon} <b>메모리 다양성 진단</b> (최근 {d['sample_size']}개)",
+        f"• Bigram 다양성: {d['bigram_diversity']:.0%}",
+        f"• 출처 비율: 인간 {d['human_ratio']:.0%} / LLM {d['llm_ratio']:.0%}",
+    ]
+    if d["warnings"]:
+        lines.append("\n<b>경고:</b>")
+        for w in d["warnings"]:
+            lines.append(f"  ⚠️ {w}")
+    else:
+        lines.append("  → 정상 범위")
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -214,6 +392,14 @@ def should_store(text: str, role: str = "user") -> Tuple[bool, str]:
     if similar_count >= 3:
         return False, f"유사 에피소드 {similar_count}개 이미 존재 — 중복 저장 방지"
 
+    # Sycophancy Filter (2606.10949): 아첨·오류 동의 패턴 차단
+    if role == "assistant":
+        agreement_markers = ["맞아", "맞습니다", "맞네요", "정확해", "그렇네요",
+                             "그렇죠", "맞죠", "당연히", "물론이죠", "당연하죠"]
+        matched = [m for m in agreement_markers if m in text]
+        if matched and len(text.strip()) < 80:
+            return False, f"아첨 패턴 감지 ({', '.join(matched)}) — 사용자 오류 동조 위험"
+
     return True, f"저장 권장 (중요도 {score:.1f}, 유사 {similar_count}개)"
 
 
@@ -233,13 +419,41 @@ def hybrid_recall(query: str, top_k: int = 5) -> str:
     """
     parts = []
 
-    # 1. Bio-Memory L2/L3 recall (기존 엔진 활용)
+    # 1. HORMA 계층 검색 (2606.11680): context_tags 클러스터 → 해당 클러스터 내 세부 검색
+    # 전체 L2 브루트포스 대신 관련 클러스터만 검색 → 토큰 효율 향상
     try:
-        from modules.bio_memory_engine import BioMemoryEngine
+        from modules.bio_memory_engine import BioMemoryEngine, ImportanceScorer
         bio = BioMemoryEngine()
-        l2_results = bio.recall(query, top_k=top_k)
+        l2_data = _load_json(_L2_PATH)
+        all_episodes = l2_data.get("episodes", [])
+
+        # Step 1: 쿼리 키워드로 관련 context_tags 클러스터 식별
+        query_kws = set(ImportanceScorer.extract_keywords(query, max_kw=6))
+        cluster_scores: dict[str, float] = {}
+        for ep in all_episodes:
+            for tag in ep.get("context_tags", []):
+                overlap = len(query_kws & set(tag.lower().split()))
+                cluster_scores[tag] = cluster_scores.get(tag, 0) + overlap + 1
+
+        top_clusters = sorted(cluster_scores, key=cluster_scores.get, reverse=True)[:3]
+
+        # Step 2: 상위 클러스터 에피소드만 세부 검색
+        candidate_eps = [
+            ep for ep in all_episodes
+            if any(t in top_clusters for t in ep.get("context_tags", []))
+        ] or all_episodes  # 클러스터 없으면 전체 fallback
+
+        # Step 3: 키워드 유사도로 상위 K개 선택
+        scored = []
+        for ep in candidate_eps:
+            ep_kws = set(ep.get("keywords", []))
+            score = len(query_kws & ep_kws) + ep.get("importance", 1.0) * 0.1
+            scored.append((score, ep))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        l2_results = [ep for _, ep in scored[:top_k]]
+
         if l2_results:
-            parts.append("🧠 [L2 연상 기억]")
+            parts.append(f"🧠 [L2 클러스터 기억 | 클러스터: {', '.join(top_clusters[:2]) or '전체'}]")
             for ep in l2_results:
                 ts = ep.get("timestamp", "")[:16].replace("T", " ")
                 imp = ep.get("importance", 0)

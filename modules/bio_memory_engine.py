@@ -76,7 +76,12 @@ class ImportanceScorer:
                 break
         if len(text) > 300: score += 0.5
         if len(text) > 800: score += 0.5
-        return round(min(score, 10.0), 2)
+        result = round(min(score, 10.0), 2)
+        # Model Collapse 방어 (Oxford 2305.17493): LLM 응답이 L2에 자동 승격되면
+        # 자기 응답을 재참조하는 피드백 루프 발생 → assistant는 임계값 미만으로 하드캡
+        if role == "assistant":
+            result = min(result, L1_TO_L2_THRESHOLD - 0.1)
+        return result
 
     @classmethod
     def extract_keywords(cls, text: str, max_kw: int = 5) -> List[str]:
@@ -126,6 +131,7 @@ class BioMemoryEngine:
         ImportanceScorer.load_config(self.config_path)
 
         self._ensure_structures()
+        self.vim = None  # VectorIndexManager — __post_init__ 에서 바인딩
 
         # 실제 MacBot의 SemanticEngine 로드 연동 (FastEmbed NPU 임베딩 가속 지원)
         try:
@@ -140,6 +146,36 @@ class BioMemoryEngine:
             except ImportError:
                 self.sem_engine = None
                 logger.warning("⚠️ [Bio-Memory] SemanticEngine 로드 실패. 키워드 기반 연상 검색으로 대체합니다.")
+
+        # 인라인 임베딩 마이그레이션: 기존 JSON 내 embedding 필드 제거 → turbovec 이관
+        # Code as Agent Harness §3.2.6 State Offloading: 무거운 상태는 외부 인덱스로
+        self._strip_inline_embeddings()
+
+    def _strip_inline_embeddings(self):
+        """기존 L2 에피소드의 인라인 embedding 필드 제거 → turbovec 외부 인덱스로 이관.
+
+        배경: embedding(384 float)을 JSON에 저장하면 에피소드당 ~3KB 과부하.
+        200개 × 3KB = 600KB+ → episodic_memory.json 비대화 원인.
+        State Offloading (Code as Agent Harness §3.2.6) 적용.
+        """
+        try:
+            l2 = self._load_json(self.l2_path)
+            episodes = l2.get("episodes", [])
+            migrated = 0
+            for ep in episodes:
+                if "embedding" in ep:
+                    emb = ep.pop("embedding")
+                    if emb and self.vim:
+                        try:
+                            self.vim.add(ep["id"], emb)
+                        except Exception:
+                            pass
+                    migrated += 1
+            if migrated:
+                self._save_json(self.l2_path, l2)
+                logger.info(f"[Bio-Memory] 인라인 임베딩 {migrated}개 제거 완료 (turbovec 이관)")
+        except Exception as e:
+            logger.warning(f"[Bio-Memory] 임베딩 마이그레이션 실패: {e}")
 
     def _ensure_config(self):
         """기본 설정 파일이 없을 경우 생성합니다."""
@@ -223,10 +259,14 @@ class BioMemoryEngine:
                 
         new_id = f"ep_{datetime.now().strftime('%Y%m%d%H%M%S%f')[:17]}"
         keywords = ImportanceScorer.extract_keywords(entry["content"])
-        
+        role = entry.get("role", "unknown")
+
         episode = {
             "id": new_id,
-            "role": entry.get("role", "unknown"),
+            "role": role,
+            # Model Collapse 방어 (Oxford 2305.17493): 출처 태깅
+            # 컨텍스트 재주입 시 human 항목 우선 보장에 사용
+            "source": "human" if role == "user" else "llm",
             "content": entry["content"],
             "timestamp": entry.get("timestamp", datetime.now(timezone.utc).isoformat()),
             "importance": entry.get("importance", 1.0),
@@ -234,12 +274,24 @@ class BioMemoryEngine:
             "access_count": 1,
             "keywords": keywords,
             "context_tags": self._generate_context_tags(entry["content"]),
-            "embedding": embedding
+            # embedding은 JSON에 저장하지 않음 → turbovec 외부 인덱스 사용
+            # (State Offloading: Code as Agent Harness §3.2.6)
         }
         
+        # turbovec 외부 인덱스에 임베딩 등록 (JSON 인라인 저장 대신)
+        if embedding:
+            if self.vim:
+                try:
+                    self.vim.add(new_id, embedding)
+                except Exception as e:
+                    logger.warning(f"[Bio-Memory] turbovec 등록 실패: {e}")
+            # vim 없을 경우에만 fallback으로 인라인 저장 (이 경우는 SemanticEngine도 없는 상태)
+            else:
+                episode["embedding"] = embedding
+
         # 연상망 엣지 생성
         associations[new_id] = []
-        
+
         # 1. 시간차 연결 (Temporal Edge)
         if episodes:
             prev_ep = episodes[-1]
@@ -248,7 +300,7 @@ class BioMemoryEngine:
             if prev_id not in associations:
                 associations[prev_id] = []
             associations[prev_id].append({"target": new_id, "weight": 1.0, "type": "temporal"})
-            
+
         # 2. 키워드 공유 연결 (Semantic Keyword Edge)
         new_kws = set(keywords)
         if new_kws:
@@ -262,17 +314,23 @@ class BioMemoryEngine:
                     if other_id not in associations:
                         associations[other_id] = []
                     associations[other_id].append({"target": new_id, "weight": weight, "type": "keyword"})
-                    
+
         episodes.append(episode)
 
-        # Hybrid Trigger: 개수 OR 파일 용량 초과 시 L3 전이
-        _current_l2_bytes = self.l2_path.stat().st_size if self.l2_path.exists() else 0
-        if len(episodes) > L2_MAX_SIZE or _current_l2_bytes > L2_MAX_BYTES:
+        # Hybrid Trigger: while 루프로 L3 전이 — if → while 수정
+        # 기존 if는 1개씩만 제거 → 이미 2.3MB인 파일에 무효. while로 기준치 복원까지 반복.
+        # _get_l2_bytes()로 실제 직렬화 크기 계산 (stat().st_size는 디스크 기준이라 부정확)
+        while len(episodes) > L2_MAX_SIZE or self._get_l2_bytes(episodes, associations) > L2_MAX_BYTES:
             episodes.sort(key=lambda x: ForgettingCurve.retention(x.get("importance", 1.0), x.get("last_accessed", x.get("timestamp", ""))))
             removed = episodes.pop(0)
             removed_id = removed["id"]
             self._note_l3_candidate(removed)
-            
+            # turbovec 인덱스에서도 제거
+            if self.vim:
+                try:
+                    self.vim.remove(removed_id)
+                except Exception:
+                    pass
             # 연상망 엣지 정화
             if removed_id in associations:
                 del associations[removed_id]
@@ -333,12 +391,12 @@ class BioMemoryEngine:
                         ep_emb = ep.get("embedding")
                         if not ep_emb:
                             ep_emb = self.sem_engine.get_embedding(ep["content"])
-                            if ep_emb:
-                                ep["embedding"] = ep_emb
+                            # ep["embedding"] = ep_emb  ← 재저장 금지: JSON 비대화 원인
                         if ep_emb:
                             # 코사인 유사도 계산
                             cos_sim = np.dot(query_emb, ep_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(ep_emb))
                             initial_scores[ep_id] = max(0.0, (cos_sim + 1.0) / 2.0) * 10.0
+                            # 임베딩을 JSON에 재저장하지 않음 (State Offloading: turbovec 사용)
                         else:
                             initial_scores[ep_id] = 0.0
                     vector_success = True
@@ -496,7 +554,10 @@ class BioMemoryEngine:
             report = self._offline_consolidation(history_data or [])
             if not llm_func: return f"❌ LLM 바인딩 미전달. 단기 기억 압축만 수행.\n{report}"
             today_str = datetime.now().strftime("%Y.%m.%d")
-            hot_content = open(self.hot_file, "r", encoding="utf-8").read() if os.path.exists(self.hot_file) else ""
+            hot_content = ""
+            if os.path.exists(self.hot_file):
+                with open(self.hot_file, "r", encoding="utf-8") as f:
+                    hot_content = f.read()
             chat_text = "\n".join([f"{h['role']}: {h['content'][:150]}" for h in history_data[-10:]])
             sys_prompt = "당신은 비서 '하네스'의 지식 정리 엔진입니다. JSON 형식 규칙을 준수하여 마크다운 블록 없이 반환하세요."
             prompt = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": f"[대화]\n{chat_text}\n\n[hot]\n{hot_content}"}]
@@ -855,6 +916,24 @@ class VectorIndexManager:
     def is_allowlisted(self, key: str) -> bool:
         """그래프 후보 자격 확인."""
         return any(kw in key.lower() for kw in self.allowlist)
+
+
+# ── BioMemoryEngine.vim 자동 바인딩 (모듈 로드 완료 후 실행) ────────────
+# VectorIndexManager가 BioMemoryEngine보다 나중에 정의되므로 모듈 레벨에서 패치
+def _auto_bind_vim(engine: "BioMemoryEngine"):
+    """BioMemoryEngine 인스턴스에 VectorIndexManager를 자동 바인딩.
+
+    __init__에서 vim=None으로 초기화 후, 모듈 완전 로드 이후 이 함수를 통해
+    VectorIndexManager를 연결. harness_agent.py의 LazyService 패턴과 호환.
+    """
+    if engine.sem_engine and engine.vim is None:
+        try:
+            engine.vim = VectorIndexManager(sem_engine=engine.sem_engine)
+            logger.info(f"⚡ [Bio-Memory] VectorIndexManager 자동 바인딩 완료")
+            # 이미 인라인 임베딩이 있으면 turbovec으로 이관
+            engine._strip_inline_embeddings()
+        except Exception as e:
+            logger.warning(f"[Bio-Memory] vim 자동 바인딩 실패: {e}")
 
 
 # ── BioMemoryEngine 확장 메서드 ─────────────────────────────

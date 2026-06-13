@@ -27,11 +27,41 @@ harness_agent.py 변경 사항:
 
 import os
 import re
+import json
 import asyncio
 import inspect
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# ── TraceGraph 설정 (2605.31308: 궤적 로깅 + 수리 경로 추적) ─────────
+_TRACE_LOG = Path("/Users/bluesea/.hermes/runtime/trace_log.jsonl")
+_TRACE_MAX_ENTRIES = 200
+
+def _trace(turn: int, tool: str, path: str, result_snippet: str, repaired: bool = False):
+    """TraceGraph 궤적 기록. 롤링 200엔트리 유지."""
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "turn": turn,
+        "tool": tool,
+        "path": path,
+        "result": result_snippet[:200],
+        "repaired": repaired,
+    }
+    try:
+        _TRACE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        if _TRACE_LOG.exists():
+            lines = _TRACE_LOG.read_text(encoding="utf-8").splitlines()
+        lines.append(json.dumps(entry, ensure_ascii=False))
+        # 롤링: 최근 200개만 유지
+        if len(lines) > _TRACE_MAX_ENTRIES:
+            lines = lines[-_TRACE_MAX_ENTRIES:]
+        _TRACE_LOG.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 # ── 도구 태그 정규식 (컴파일하여 재사용) ────────────────────────────
 _RE_LIST     = re.compile(r"\[LIST:\s*(.*?)\]")
@@ -46,6 +76,27 @@ _RE_COPY     = re.compile(r"\[COPY:\s*(.*?)\s*(?:->|→|to)\s*(.*)\]")
 _RE_RENAME   = re.compile(r"\[RENAME:\s*(.*?)\s*(?:->|→|to)\s*(.*)\]")
 
 _SCRIPTS_DIR = "/Users/bluesea/Applications/Mjauto/Scripts"
+
+# ── Goal-Autopilot: 검증 게이트 (2606.11688) ────────────────────────
+# 태그 실행 후 실제 성공 여부를 구조적으로 검증. 거짓 완료 보고 방지.
+_FAILURE_SIGNALS = [
+    "error", "오류", "실패", "traceback", "exception",
+    "not found", "permission denied", "no such file",
+    "cannot", "unable", "command not found", "errno",
+]
+
+def _verify_gate(tag_type: str, result: str, artifact: str = "") -> str:
+    """
+    태그 실행 결과 검증. 실패 감지 시 경고 문자열 반환, 통과 시 빈 문자열.
+    Goal-Autopilot 원칙: 거짓 성공은 구조적으로 불가능하게.
+    """
+    result_lower = result.lower()
+    if any(sig in result_lower for sig in _FAILURE_SIGNALS):
+        return f"[⚠️ VerificationGate] {tag_type} 실패 감지 — 완료 선언 금지: {result[:120]}"
+    if tag_type == "CREATE" and artifact:
+        if not os.path.exists(artifact):
+            return f"[⚠️ VerificationGate] CREATE 검증 실패 — 파일 미존재: {artifact}"
+    return ""
 
 
 async def run_agentic_loop(
@@ -76,8 +127,10 @@ async def run_agentic_loop(
         return max(1, len(str(text)) // 3)
 
     ans = initial_ans
+    _turn = 0
 
     for _ in range(3):
+        _turn += 1
         executed = False
         exec_results: list[str] = []
 
@@ -91,6 +144,7 @@ async def run_agentic_loop(
             exec_results.append(
                 f"[📂 LIST 결과 (필터링 적용)]\n{dir_map}\n\n[📖 폴더 컨텍스트]\n{ctx}"
             )
+            _trace(_turn, "LIST", target_dir, dir_map[:100])
             executed = True
 
         # ── READ ────────────────────────────────────────────────────
@@ -108,6 +162,7 @@ async def run_agentic_loop(
                     artifacts=[os.path.basename(target_file)],
                 ).to_prompt()
             )
+            _trace(_turn, "READ", target_file, res[:100])
             executed = True
 
         # ── WEB_READ ─────────────────────────────────────────────────
@@ -150,7 +205,13 @@ async def run_agentic_loop(
         if m:
             cmd_text = m.group(1).strip()
             await _prog(update_progress_fn, "💻 명령어 실행 중...")
-            exec_results.append(await _exec_cmd(cmd_text, update, context))
+            cmd_result = await _exec_cmd(cmd_text, update, context)
+            exec_results.append(cmd_result)
+            gate_warn = _verify_gate("RUN_CMD", cmd_result)
+            repaired = bool(gate_warn)
+            if gate_warn:
+                exec_results.append(gate_warn)
+            _trace(_turn, "RUN_CMD", cmd_text[:80], cmd_result[:100], repaired=repaired)
             executed = True
 
         # ── CREATE ───────────────────────────────────────────────────
@@ -160,7 +221,13 @@ async def run_agentic_loop(
             await _prog(update_progress_fn, f"✍️ 파일 생성 중: `{os.path.basename(create_path)}`...")
             if inspect.iscoroutinefunction(_handle_file_op):
                 await _handle_file_op(update, context, "CREATE", create_path, create_content)
-            exec_results.append(f"[✅ CREATE 완료: {create_path}]")
+            create_result = f"[✅ CREATE 완료: {create_path}]"
+            exec_results.append(create_result)
+            gate_warn = _verify_gate("CREATE", create_result, create_path)
+            repaired = bool(gate_warn)
+            if gate_warn:
+                exec_results.append(gate_warn)
+            _trace(_turn, "CREATE", create_path, create_result[:80], repaired=repaired)
             executed = True
 
         # ── DELETE ───────────────────────────────────────────────────

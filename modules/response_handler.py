@@ -136,8 +136,38 @@ async def handle_llm_response(
         except Exception:
             pass
 
+        # 규칙 6: 재질문/정정 감지 → SkillLifecycle 피드백 소급 수정
+        try:
+            from handlers._base import _detect_correction, emit_skill_feedback
+            if _detect_correction(user_text):
+                # 마지막 스킬 실행 결과를 실패로 소급 기록
+                # (현재는 skill_name 추적이 없으므로 "_last_response" sentinel 사용)
+                emit_skill_feedback("_last_response", success=False)
+        except Exception:
+            pass
+
         history.add_message("user", user_text)
         history.add_message("assistant", ans)
+
+        # 규칙 5: 세션 포화도 경고 — 75%+ 도달 시 응답 말미에 알림 삽입
+        try:
+            pressure = history.get_context_pressure()
+            if pressure["warn"] and not pressure["critical"]:
+                pct = int(pressure["ratio"] * 100)
+                ans += (
+                    f"\n\n---\n💡 **[컨텍스트 {pct}% 소모]** "
+                    f"현재 {pressure['turns']}턴 / 압축 기준 {pressure['turns']*100//pct}턴. "
+                    "작업이 길어질 경우 새 창에서 이어가는 것을 권장합니다."
+                )
+            elif pressure["critical"]:
+                ans += (
+                    "\n\n---\n⚠️ **[컨텍스트 포화]** "
+                    "대화 히스토리가 자동 압축되었습니다. "
+                    "중요한 작업은 새 창에서 시작하세요."
+                )
+        except Exception:
+            pass
+
         from handlers._base import _reply_long
         await _reply_long(
             update.message,

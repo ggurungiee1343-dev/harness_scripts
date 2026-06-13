@@ -82,6 +82,28 @@ async def add_to_history(role: str, content: str) -> None:
         logger.error(f'❌ Bio-Memory 기록 실패: {e}')
 
 
+# 규칙 6: 재질문/정정 감지 패턴 (MJ 피드백 신호)
+_CORRECTION_SIGNALS = [
+    "다시", "틀렸", "아니야", "아니잖아", "잘못됐", "잘못 됐",
+    "그게 아니", "그거 아니", "다르잖", "틀리잖", "아닌데",
+    "wrong", "incorrect", "that's not",
+]
+
+def _detect_correction(text: str) -> bool:
+    """MJ 발화에 정정 신호가 포함되어 있으면 True."""
+    t = text.lower()
+    return any(sig in t for sig in _CORRECTION_SIGNALS)
+
+
+def emit_skill_feedback(skill_name: str, success: bool) -> None:
+    """SkillLifecycle에 피드백 신호 전달. 규칙 6 — 우연 vs 실력 기록."""
+    try:
+        from modules.skill_auditor import get_skill_lifecycle
+        get_skill_lifecycle().record_feedback(skill_name, success)
+    except Exception as e:
+        logger.debug(f"[FeedbackHook] record_feedback 실패 (무시): {e}")
+
+
 # 콜백 처리는 _callbacks.py로 분리 (2026-06-09)
 from handlers._callbacks import handle_button_callback
 

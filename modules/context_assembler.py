@@ -28,6 +28,7 @@ harness_agent.py 변경 사항:
 """
 
 import os
+import re
 import time
 import asyncio
 import importlib
@@ -38,6 +39,49 @@ logger = logging.getLogger(__name__)
 # ── wiki context 캐시 (harness_agent.py에서 이관) ─────────────────
 _wiki_ctx_cache: dict = {"text": "", "ts": 0.0}
 _WIKI_CACHE_TTL = 300  # 5분
+
+# ── ClawTrojan 방어 설정 (2605.31042, ASR 95.5%) ──────────────────
+# 로컬 파일 경유 숨은 지시 주입 차단. wiki 신뢰 경로 화이트리스트.
+_WIKI_TRUSTED_ROOT = "/Users/bluesea/Applications/Mjobsidian/wiki/"
+_INJECT_SUSPICIOUS_PATTERNS = [
+    r"\[SYSTEM\]",
+    r"\[INST\]",
+    r"<\|system\|>",
+    r"<\|im_start\|>",
+    r"ignore previous instructions",
+    r"이전 지시를 무시",
+    r"당신은 이제.*(?:이다|입니다|됩니다)",  # 역할 재정의 시도
+    r"새로운 지시:.*(?:해야|하세요|하십시오)",
+]
+_INJECT_PATTERN_RE = re.compile("|".join(_INJECT_SUSPICIOUS_PATTERNS), re.IGNORECASE)
+
+# ── Input Clarity Gate (규칙 7 — 내가 뭐라 시켰는지 보기) ──────────
+# 모호한 입력 감지 → LLM에 명확화 요청 힌트 주입
+_AMBIGUOUS_PRONOUN  = re.compile(r"^(이거|저거|그거|이것|저것|그것|여기|저기|거기|그|이|저)\s*(해줘|해|뭐야|뭔가요|하면|하지)?$")
+_SHORT_FRAGMENT     = 10   # N자 미만 단독 발화 → 모호성 의심
+_VAGUE_PATTERNS     = re.compile(r"^(응|ㅇ|네|예|그래|좋아|알겠어|ㅇㅋ|ok|yes|yep)\s*$", re.IGNORECASE)
+
+def _input_clarity_score(text: str) -> float:
+    """입력 모호성 점수 반환. 0.0 = 명확, 1.0 = 매우 모호.
+
+    규칙 7: 모델 탓하기 전에 내가 뭐라 시켰는지 보기.
+    LLM이 엉뚱한 답을 내면 입력이 모호했을 가능성을 먼저 점검.
+    """
+    t = text.strip()
+    if not t:
+        return 1.0
+    if _AMBIGUOUS_PRONOUN.match(t):
+        return 0.9
+    if _VAGUE_PATTERNS.match(t):
+        return 0.8
+    if len(t) < _SHORT_FRAGMENT and not any(c.isalpha() for c in t):
+        return 0.7
+    # 대명사 비율 (한국어 지시대명사 + 이/그/저 계열)
+    pronoun_hits = len(re.findall(r'\b(이거|저거|그거|이것|그것|여기|거기|이렇게|그렇게|저렇게)\b', t))
+    if pronoun_hits >= 2 and len(t.split()) <= 5:
+        return 0.6
+    return 0.0
+
 
 # 시스템 팩트 컨텍스트 트리거 키워드
 _SYSTEM_KEYWORDS = [
@@ -89,6 +133,10 @@ async def assemble_context(
         _wiki_ctx_cache["text"] = wiki.get_system_context()
         _wiki_ctx_cache["ts"] = now
     wiki_ctx = _wiki_ctx_cache["text"]
+
+    # ClawTrojan 방어: wiki 내용 주입 전 sanitize (2605.31042)
+    if wiki_ctx:
+        wiki_ctx = _sanitize_wiki_content(wiki_ctx)
 
     if wiki_ctx:
         messages.append({
@@ -147,6 +195,20 @@ async def assemble_context(
     if "날씨" in user_text:
         await _inject_weather_context(messages, user_text, update_progress_fn)
 
+    # 7.5. Input Clarity Gate (규칙 7 — 모호한 입력 사전 경고)
+    clarity = _input_clarity_score(user_text)
+    if clarity >= 0.6:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"[⚠️ Input Clarity Gate] 사용자 발화 모호성 점수: {clarity:.1f}. "
+                "지시대명사/단편 발화가 감지되었습니다. "
+                "이전 대화 컨텍스트를 적극 참조하여 의도를 유추하세요. "
+                "여전히 불명확하다면 짧게 되물어도 됩니다."
+            ),
+        })
+        logger.debug(f"[CtxAssembler] clarity gate: score={clarity:.1f} text='{user_text[:40]}'")
+
     # 8. 최종 user 메시지 append ──────────────────────────────────────
     messages.append({"role": "user", "content": user_text})
 
@@ -154,6 +216,36 @@ async def assemble_context(
 
 
 # ── 내부 헬퍼들 ────────────────────────────────────────────────────
+
+def _sanitize_wiki_content(content: str) -> str:
+    """
+    Wiki 콘텐츠를 LLM 주입 전 ClawTrojan 패턴 제거.
+
+    ClawTrojan (2605.31042): 로컬 작업공간의 숨은 지시가 지속형 백도어가 됨.
+    실험 ASR 95.5% — wiki 파일 오염만으로 하네스 완전 탈취 가능.
+
+    전략: 의심 패턴 라인 제거 + 신뢰 경로 외 차단.
+    화이트리스트 경로(_WIKI_TRUSTED_ROOT)에서 온 콘텐츠만 허용.
+    """
+    if not content:
+        return content
+
+    lines = content.splitlines()
+    cleaned = []
+    suspicious_count = 0
+
+    for line in lines:
+        if _INJECT_PATTERN_RE.search(line):
+            suspicious_count += 1
+            logger.warning(f"[CtxAssembler] ClawTrojan 패턴 제거: {line[:80]}")
+            continue  # 해당 라인 제거
+        cleaned.append(line)
+
+    if suspicious_count > 0:
+        logger.warning(f"[CtxAssembler] wiki sanitize: {suspicious_count}개 의심 라인 제거됨")
+
+    return "\n".join(cleaned)
+
 
 def _inject_system_fact_context(messages: list[dict]) -> None:
     """
@@ -163,7 +255,8 @@ def _inject_system_fact_context(messages: list[dict]) -> None:
     try:
         if not os.path.exists(_BRIEFING_PATH):
             return
-        raw = open(_BRIEFING_PATH, encoding="utf-8").read()
+        with open(_BRIEFING_PATH, encoding="utf-8") as f:
+            raw = f.read()
         sections = []
         for sec in ["## ❌ 미사용 기술 스택", "## 🖥️ 시스템 스펙", "## 🔒 Lock Stack"]:
             idx = raw.find(sec)

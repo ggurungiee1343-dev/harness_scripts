@@ -5,6 +5,9 @@ COMPACT_THRESHOLD = 30   # 이 턴 수 초과 시 요약 압축 실행
 KEEP_RECENT       = 10   # 압축 후 보존할 최근 턴 수 (verbatim)
 SUMMARY_MARKER    = "[📦 이전 대화 요약]"
 
+# 조기 핸드오프 경고 임계값 (규칙 5 — 세션 포화 전 알림)
+HANDOFF_WARN_RATIO = 0.75  # COMPACT_THRESHOLD의 75% 도달 시 경고
+
 class HistoryManager:
     def __init__(self, file_path):
         self.file_path = file_path
@@ -45,6 +48,21 @@ class HistoryManager:
             "content": "\n".join(summary_lines)
         }
         return [summary_msg] + recent_turns
+
+    def get_context_pressure(self) -> dict:
+        """컨텍스트 포화도 반환. 규칙 5: 세션 터지기 전 미리 알림.
+
+        Returns:
+            {turns: int, ratio: float, warn: bool, critical: bool}
+        """
+        turns = len(self.history)
+        ratio = turns / COMPACT_THRESHOLD
+        return {
+            "turns": turns,
+            "ratio": round(ratio, 2),
+            "warn":     ratio >= HANDOFF_WARN_RATIO,   # 75%+ → 경고
+            "critical": ratio >= 1.0,                  # 100%+ → 압축 실행
+        }
 
     def compact_and_save(self):
         """강제 압축 저장 — 외부에서 명시적 호출 가능."""
