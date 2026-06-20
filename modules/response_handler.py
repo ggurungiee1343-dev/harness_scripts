@@ -169,10 +169,13 @@ async def handle_llm_response(
             pass
 
         from handlers._base import _reply_long
-        await _reply_long(
-            update.message,
-            f"🧠 [{engine}]\n\n" + unicodedata.normalize("NFC", ans),
-        )
+        _self_id_keywords = ("너는 누구", "무슨 api", "어떤 api", "무슨 모델", "어떤 모델", "뭔 api", "뭔 모델", "너 api", "너 모델")
+        _ask_lower = user_text.lower()
+        if any(k in _ask_lower for k in _self_id_keywords):
+            final_ans = unicodedata.normalize("NFC", ans) + f"\n\n현재 선택된 엔진: `{engine}`"
+        else:
+            final_ans = unicodedata.normalize("NFC", ans)
+        await _reply_long(update.message, final_ans)
 
     except Exception as e:
         try:

@@ -22,7 +22,7 @@ if getattr(config, "CAPT_NVIDIA_API_KEY", ""):
     nvidia_client = openai.OpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=config.CAPT_NVIDIA_API_KEY,
-        timeout=60.0
+        timeout=180.0
     )
 
 local_client = openai.OpenAI(

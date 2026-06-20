@@ -11,8 +11,12 @@ V_FINAL 전략 인터페이스
   사진 전송                        — 차트 이미지 분석
 """
 import base64
+import json
 import logging
-from telegram import Update
+import socket
+import subprocess
+from pathlib import Path
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
@@ -716,6 +720,215 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ════════════════════════════════════════════════════════════════
+# MJstock 나스닥 500 자동 스캔
+# ════════════════════════════════════════════════════════════════
+
+async def cmd_mjscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mjscan — MJstock 나스닥 500 자동 스캔 + 텔레그램 발송
+
+    사용:
+      /mjscan         — 8개 검색식 모두 실행
+      /mjscan selyeok — 특정 검색식만 실행
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    mjstock_dir = Path("/Users/bluesea/Applications/Mjstock")
+    auto_scan_script = mjstock_dir / "auto_scan_nasdaq500.py"
+
+    if not auto_scan_script.exists():
+        await safe_reply(update.message, "❌ auto_scan_nasdaq500.py 파일 없음")
+        return
+
+    msg = await safe_reply(update.message, "⏳ MJstock 나스닥 500 스캔 시작...")
+
+    try:
+        # 스캔 실행
+        result = subprocess.run(
+            [sys.executable, str(auto_scan_script)],
+            capture_output=True,
+            text=True,
+            cwd=str(mjstock_dir),
+            timeout=600,  # 10분 타임아웃
+        )
+
+        if result.returncode == 0:
+            lines = ["✅ MJstock 나스닥 500 스캔 완료!"]
+            if "✅" in result.stdout:
+                # 결과에서 성공 수 추출
+                success_lines = [l for l in result.stdout.split('\n') if '✅' in l]
+                lines.extend(success_lines[:10])  # 상위 10개
+
+            await safe_edit(msg, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await safe_edit(msg, f"❌ 스캔 실패\n```\n{result.stderr[:500]}\n```", parse_mode=ParseMode.MARKDOWN)
+
+    except subprocess.TimeoutExpired:
+        await safe_edit(msg, "⏱️ 스캔 타임아웃 (10분 초과)", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await safe_edit(msg, f"❌ 오류: {str(e)[:200]}", parse_mode=ParseMode.MARKDOWN)
+
+
+# ════════════════════════════════════════════════════════════════
+# MJstock 단일 종목 검색식 분석 (/mjstock TICKER)
+# ════════════════════════════════════════════════════════════════
+
+MJSTOCK_DIR   = Path("/Users/bluesea/Applications/Mjstock")
+SCAN_SINGLE   = MJSTOCK_DIR / "screener" / "scan_single.py"
+VENV_PYTHON   = MJSTOCK_DIR / ".venv" / "bin" / "python"
+DASHBOARD_PORT = 8765
+
+US_SCREENERS = [
+    ("우량주농사",    "uryangju"),
+    ("세력주농사",    "selyeok"),
+    ("세력포착",      "pochak"),
+    ("주도주단기",    "judoju"),
+    ("단타의신",      "danta"),
+    ("슈팅",         "shooting"),
+    ("단타추돌이",    "chuddoli"),
+    ("초우량주",      "chowuryang"),
+]
+KR_SCREENERS = [
+    ("우량주(KR)",   "uryangju_kr"),
+    ("세력주(KR)",   "selyeok_kr"),
+    ("세력포착(KR)", "pochak_kr"),
+    ("주도주(KR)",   "judoju_kr"),
+    ("단타(KR)",     "danta_kr"),
+    ("초우량(KR)",   "chowuryang_kr"),
+]
+
+def _get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
+
+
+async def cmd_mjstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mjstock TICKER — 검색식 선택 후 단일 종목 분석"""
+    args = context.args or []
+    if not args:
+        await safe_reply(update.message,
+            "📈 사용법: <code>/mjstock NVDA</code>\n"
+            "또는 한국 주식: <code>/mjstock 005930</code>",
+            parse_mode="HTML")
+        return
+
+    ticker = args[0].upper()
+
+    # 티커가 숫자면 KR 전용, 아니면 US + KR 모두 표시
+    is_kr = ticker.isdigit()
+    screeners = KR_SCREENERS if is_kr else US_SCREENERS
+
+    keyboard = []
+    row = []
+    for label, key in screeners:
+        btn = InlineKeyboardButton(label, callback_data=f"mjstock:{ticker}:{key}")
+        row.append(btn)
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    # US 종목이면 KR 버튼 행도 추가
+    if not is_kr:
+        keyboard.append([InlineKeyboardButton("─── 한국 검색식 ───", callback_data="mjstock:noop")])
+        row = []
+        for label, key in KR_SCREENERS:
+            btn = InlineKeyboardButton(label, callback_data=f"mjstock:{ticker}:{key}")
+            row.append(btn)
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+
+    await safe_reply(update.message,
+        f"📊 <b>{ticker}</b> — 검색식 선택",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def callback_mjstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """인라인 버튼: mjstock:TICKER:SCREENER"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # "mjstock:NVDA:selyeok"
+    parts = data.split(":")
+    if len(parts) != 3 or parts[1] == "noop":
+        return
+
+    _, ticker, screener_key = parts
+    py = str(VENV_PYTHON) if VENV_PYTHON.exists() else "python3"
+
+    await query.edit_message_text(f"⏳ {ticker} × {screener_key} 분석 중...")
+
+    try:
+        proc = subprocess.run(
+            [py, str(SCAN_SINGLE), "--ticker", ticker, "--screener", screener_key],
+            capture_output=True, text=True,
+            cwd=str(MJSTOCK_DIR / "screener"),
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            await query.edit_message_text(f"❌ 실행 오류\n{proc.stderr[:300]}")
+            return
+
+        res = json.loads(proc.stdout.strip())
+    except subprocess.TimeoutExpired:
+        await query.edit_message_text("⏱ 타임아웃 (60초 초과)")
+        return
+    except Exception as e:
+        await query.edit_message_text(f"❌ 오류: {e}")
+        return
+
+    if not res.get("ok"):
+        await query.edit_message_text(f"❌ {res.get('error', '분석 실패')}")
+        return
+
+    score = res.get("score", 0)
+    filled = round(score / 100 * 10)
+    bar = "█" * filled + "░" * (10 - filled)
+
+    # bool 조건 목록
+    bool_items = [(k, v) for k, v in res.items()
+                  if isinstance(v, bool) and not k.startswith("exp_")]
+    cond_lines = []
+    for k, v in bool_items[:12]:
+        icon = "✅" if v else "❌"
+        cond_lines.append(f"{icon} {k}")
+
+    pass_cnt  = sum(1 for _, v in bool_items if v)
+    total_cnt = len(bool_items)
+
+    ip = _get_local_ip()
+    chart_url = f"http://{ip}:{DASHBOARD_PORT}/chart/{screener_key}/{ticker}"
+
+    lines = [
+        f"📊 <b>{ticker}</b>  [{screener_key}]",
+        f"",
+        f"점수: <b>{score}점</b>  [{bar}]",
+        f"조건: {pass_cnt}/{total_cnt} 통과",
+        f"",
+    ]
+    if cond_lines:
+        lines += cond_lines
+    lines += [
+        f"",
+        f"📱 차트: {chart_url}",
+    ]
+
+    await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+
+
+# ════════════════════════════════════════════════════════════════
 # hermes_local.py 등록용 커맨드 맵
 # ════════════════════════════════════════════════════════════════
 STOCK_COMMANDS = {
@@ -726,4 +939,6 @@ STOCK_COMMANDS = {
     "positions": cmd_positions,
     "result":    cmd_result,
     "backtest":  cmd_backtest,
+    "mjscan":    cmd_mjscan,
+    "mjstock":   cmd_mjstock,
 }

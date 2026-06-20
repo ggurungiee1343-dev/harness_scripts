@@ -50,3 +50,12 @@ def analyze_url(url, question):
     messages = [{"role": "user", "content": prompt}]
     ans, _ = router.send_completion(messages)
     return ans
+
+
+class WebReader:
+    """agentic_loop에서 WebReader().fetch_url() 형태로 호출하는 래퍼"""
+    def fetch_url(self, url: str) -> str:
+        return fetch_url(url)
+
+    def analyze_url(self, url: str, question: str) -> str:
+        return analyze_url(url, question)

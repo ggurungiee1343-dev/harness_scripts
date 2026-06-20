@@ -455,7 +455,8 @@ def main():
     try:
         from handlers._stock import (
             cmd_stock, cmd_scan, cmd_market, cmd_watchlist,
-            cmd_positions, cmd_result, cmd_backtest, handle_stock_photo
+            cmd_positions, cmd_result, cmd_backtest, handle_stock_photo,
+            cmd_mjstock,
         )
         app.add_handler(CommandHandler('stock',     cmd_stock))
         app.add_handler(CommandHandler('scan',      cmd_scan))
@@ -464,6 +465,7 @@ def main():
         app.add_handler(CommandHandler('positions', cmd_positions))
         app.add_handler(CommandHandler('result',    cmd_result))
         app.add_handler(CommandHandler('backtest',  cmd_backtest))
+        app.add_handler(CommandHandler('mjstock',   cmd_mjstock))
         app.add_handler(MessageHandler(filters.PHOTO, handle_stock_photo))
         logger.info("✅ 주식 분석 핸들러 등록 완료 (V_FINAL + 피드백 루프)")
     except Exception as e:
@@ -474,14 +476,18 @@ def main():
     app.add_error_handler(global_error_handler)
 
     import asyncio as _asyncio_local
+    _HEARTBEAT = Path.home() / '.hermes' / 'runtime' / 'bot_heartbeat'
     async def _run_polling_managed():
         async with app:
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True)
-            while app.updater.running: await _asyncio_local.sleep(15)
+            while app.updater.running:
+                _HEARTBEAT.touch()
+                await _asyncio_local.sleep(15)
 
     try: _asyncio_local.run(_run_polling_managed())
-    except Exception: pass
+    except Exception as e:
+        logger.error(f"[Polling 종료 원인] {type(e).__name__}: {e}")
     finally: sys.exit(0)
 
 
