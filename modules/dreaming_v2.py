@@ -20,8 +20,8 @@ class DreamingV2:
         self.llm_interface = LLMInterface()
         
         # SKILLOPT & FluxMem 하이퍼파라미터 제어 레이어
-        self.edit_budget = 4       # 한 세션당 최대 허용 패치 수 (Learning Rate 사상)
-        self.pems_threshold = 0.01 # 지식 진화 수렴 한계선 (이하로 떨어지면 LLM 호출 완전 차단)
+        self.edit_budget = 4       # 한 세션당 최대 허용 패치 수
+        self._last_distill_time = 0  # 마지막 증류 실행 시각 (epoch)
 
         # v8.6 Pub-Sub 이벤트 버스 상시 동적 리스너 활성화
         TagLinker.subscribe("conversation_ended", lambda data: asyncio.create_task(self.on_conversation(data)))
@@ -85,10 +85,10 @@ class DreamingV2:
 
     def _append_to_hot_md(self, summary: str):
         if not summary: return
-        hot_path = os.path.expanduser("~/Applications/Mjobsidian/hot.md")
+        hot_path = os.path.expanduser("~/Applications/Mjobsidian/wiki/00_Meta/01_hot.md")
         try:
             with open(hot_path, "a", encoding="utf-8") as f:
-                f.write(f"\n- [v8.9 Stream] {summary}")
+                f.write(f"\n- [Dreaming Stream] {summary}")
         except Exception as e:
             print(f"⚠️ hot.md 스트리밍 기록 실패: {e}")
 
@@ -137,21 +137,18 @@ class DreamingV2:
 
         conn = sqlite3.connect(self.temp_db_path, timeout=10.0)
         
-        # 1. [FluxMem 검증] 현재 지식의 성숙도(PEMS) 연산 및 자율 수면 판단
-        previous_pems = 0.158 # 기본 캐시 구조 초기값
-        last_pems_row = conn.execute("SELECT pems_value FROM pems_history ORDER BY id DESC LIMIT 1").fetchone()
-        if last_pems_row: previous_pems = last_pems_row[0]
-        
-        # PEMS를 동적으로 계산: 이전 값에 약간의 변동을 줘서 항상 수렴 판정 방지
-        import random
-        _sr = 0.5 + random.random() * 0.4           # 0.5~0.9
-        _tl = max(100, int(random.random() * 1000))
-        _ed = random.random() * 0.1                   # 0.0~0.1
-        current_pems = self._calculate_pems(success_rate=_sr, token_length=_tl, embedding_diff=_ed)
-        delta_pems = abs(current_pems - previous_pems)
-        
-        if delta_pems < self.pems_threshold and previous_pems > 0.05:
-            print(f"💤 [v8.9 FluxMem] 지식 성숙도 수렴 상태 확인 (ΔPEMS: {delta_pems:.5f}). 무분별한 LLM 연산을 100% 차단합니다. (정화 작업은 이미 완료됨)")
+        # 1. 실제 처리 대상 확인 — 미처리 raw_events가 없으면 조기 종료
+        pending_count = conn.execute("SELECT COUNT(*) FROM raw_events WHERE distilled = 0").fetchone()[0]
+        if pending_count == 0:
+            print(f"💤 [DreamingV2] 처리할 미증류 이벤트 없음. 종료.")
+            conn.close()
+            return 0
+
+        # 최소 실행 간격 체크 (1시간 이내 재실행 방지)
+        MIN_INTERVAL = 3600
+        if time.time() - self._last_distill_time < MIN_INTERVAL:
+            elapsed = int(time.time() - self._last_distill_time)
+            print(f"💤 [DreamingV2] 마지막 증류로부터 {elapsed}초 경과 — 최소 간격({MIN_INTERVAL}s) 미달. 건너뜀.")
             conn.close()
             return 0
 
@@ -203,28 +200,18 @@ class DreamingV2:
             # v8.6 AI 게이트웨이 복원 회로 가동 및 지식 요약 전용 요약 유연성(temp=0.7) 호출
             distilled_knowledge = await self.llm_interface.complete(prompt, provider="deepseek", max_tokens=2000, temperature=0.7)
             
-            # 5. [SKILLOPT Validation Gate] 제안된 지식의 무결성 모의 검증 시뮬레이션
-            # (실제 환경에서는 held-out 데이터 스코어링 매핑 지점)
-            validation_score = 0.85 
-            current_best_score = 0.80
-            
-            if validation_score > current_best_score:
+            # 5. LLM 응답이 비어있지 않으면 저장
+            if distilled_knowledge and len(distilled_knowledge.strip()) > 20:
                 # 🏰 검증 관문을 통과했을 때만 최종 마크다운 보관소 파일 영구 업데이트 승인
                 self._commit_to_mjobsidian(distilled_knowledge)
                 self._commit_to_l3_semantic(distilled_knowledge)
                 
                 placeholders = ",".join(["?"] * len(row_ids))
                 conn.execute(f"UPDATE raw_events SET distilled = 1 WHERE id IN ({placeholders})", row_ids)
-                conn.execute("INSERT INTO pems_history (pems_value, recorded_at) VALUES (?, datetime('now'))", (current_pems,))
                 conn.commit()
+                self._last_distill_time = time.time()
                 processed_count = len(row_ids)
-                print(f"✅ [v8.9 SKILLOPT Gate] 검증 스코어 통과 ({validation_score} > {current_best_score}). 지식 패치가 무결하게 고착화되었습니다.")
-            else:
-                # 검증에 실패한 제안은 오답노트 버퍼에 박제하여 다음 연산의 부정적 피드백으로 변환
-                conn.execute("INSERT INTO rejected_edits (failed_patch, recorded_at) VALUES (?, datetime('now'))", (distilled_knowledge[:200],))
-                conn.commit()
-                processed_count = 0
-                print("🗑️ [v8.9 SKILLOPT Gate] 성능 저하 유발 패치 감지. 저장을 차단하고 실패 버퍼에 박제했습니다.")
+                print(f"✅ [DreamingV2] {processed_count}개 이벤트 증류 완료.")
                 
         except Exception as e:
             print(f"❌ [v8.9 엔진] deep_distill 치명적 연산 실패 (데이터 원본 디스크 안전 보존 완료): {e}")

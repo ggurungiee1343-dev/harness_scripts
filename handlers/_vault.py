@@ -328,7 +328,16 @@ async def _vault_graph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # ── 6. 커뮤니티 클러스터링 + HTML 생성 ──────────────
         communities = graphify.cluster(G)
         html_path = Path(BASE_DIR) / "graph.html"
-        graphify.to_html(G, communities, str(html_path))
+        # 노드 5000 초과 시 GRAPHIFY_VIZ_NODE_LIMIT 환경변수로 제한 해제
+        import os as _os
+        _os.environ.setdefault("GRAPHIFY_VIZ_NODE_LIMIT", "10000")
+        try:
+            graphify.to_html(G, communities, str(html_path))
+        except Exception as _html_e:
+            if "too large" in str(_html_e).lower() or "node" in str(_html_e).lower():
+                html_path = None  # HTML 시각화 skip, 텍스트 리포트만 반환
+            else:
+                raise
 
         # ── 7. surprising_connections ──────────────────────
         surprises = []
@@ -355,7 +364,7 @@ async def _vault_graph(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"  └─ `{s.get('source','?')[:40]}` ↔ `{s.get('target','?')[:40]}`"
                 for s in surprises
             ) if surprises else "")
-            + f"{NL}{NL}📊 **시각화 HTML**: `file://{html_path}`"
+            + (f"{NL}{NL}📊 **시각화 HTML**: `file://{html_path}`" if html_path else f"{NL}{NL}⚠️ **HTML 시각화 skip** — 노드 {n_nodes}개 초과 (환경변수 GRAPHIFY_VIZ_NODE_LIMIT=10000 설정됐으나 라이브러리 내부 제한)")
             + f"{NL}> 💡 `/vault check`로 전체 진단 · `wiki/`내 모든 .md 대상"
         )
 

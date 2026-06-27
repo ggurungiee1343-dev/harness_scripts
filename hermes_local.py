@@ -60,7 +60,11 @@ logger = logging.getLogger('HermesOrchestrator')
 
 async def global_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(context.error, Conflict):
-        logger.warning(f'Telegram Conflict error: {context.error}')
+        # 중복 인스턴스 → 이 프로세스가 구 인스턴스이므로 자신을 종료
+        # botwatch(check_bot_alive.sh)가 5분 이내 새 인스턴스 감지 후 복구
+        logger.warning(f'Telegram Conflict — 중복 인스턴스. 현재 프로세스 종료: {context.error}')
+        import os, signal
+        os.kill(os.getpid(), signal.SIGTERM)
     elif isinstance(context.error, TelegramError):
         logger.warning(f'Telegram error: {context.error}')
     else:
@@ -98,7 +102,7 @@ def load_custom_env(env_path: str = '/Users/bluesea/.hermes/.env'):
 
 load_custom_env()
 
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TOKEN = os.environ.get('HERMES1_BOT_TOKEN') or os.environ.get('TELEGRAM_BOT_TOKEN')
 ALLOWED_ID_STR = os.environ.get('TELEGRAM_ALLOWED_USERS', '5365732604')
 ALLOWED_ID = int(ALLOWED_ID_STR.split(',')[0])
 
@@ -322,9 +326,9 @@ def main():
         try:
             count = await dreaming_engine.deep_distill()
             if count > 0:
-                await update.message.reply_text(f"✅ 진화 성공: 총 {count}개의 원시 이력이 고농축 마크다운 지식 회로로 전환되었습니다.")
+                await update.message.reply_text(f"✅ 증류 완료: {count}개 원시 이벤트 → Journal + L3 semantic_memory 저장.")
             else:
-                await update.message.reply_text("💤 시스템 알림: 현재 지식 성숙도가 최적의 상태(수렴)이므로 불필요한 LLM 호출을 생략했습니다.")
+                await update.message.reply_text("💤 건너뜀: 미처리 이벤트가 없거나 마지막 증류로부터 1시간 미경과. (/memory 로 L2 상태 확인 가능)")
         except Exception as e:
             await update.message.reply_text(f"❌ 진화 실패: {e}")
 
@@ -451,25 +455,7 @@ def main():
     app.add_handler(CommandHandler('verify_harness', cmd_verify_harness))
     app.add_handler(CommandHandler('retry', cmd_retry))
 
-    # ── 주식 분석 핸들러 (V_FINAL) ──────────────────────────
-    try:
-        from handlers._stock import (
-            cmd_stock, cmd_scan, cmd_market, cmd_watchlist,
-            cmd_positions, cmd_result, cmd_backtest, handle_stock_photo,
-            cmd_mjstock,
-        )
-        app.add_handler(CommandHandler('stock',     cmd_stock))
-        app.add_handler(CommandHandler('scan',      cmd_scan))
-        app.add_handler(CommandHandler('market',    cmd_market))
-        app.add_handler(CommandHandler('watchlist', cmd_watchlist))
-        app.add_handler(CommandHandler('positions', cmd_positions))
-        app.add_handler(CommandHandler('result',    cmd_result))
-        app.add_handler(CommandHandler('backtest',  cmd_backtest))
-        app.add_handler(CommandHandler('mjstock',   cmd_mjstock))
-        app.add_handler(MessageHandler(filters.PHOTO, handle_stock_photo))
-        logger.info("✅ 주식 분석 핸들러 등록 완료 (V_FINAL + 피드백 루프)")
-    except Exception as e:
-        logger.warning(f"주식 핸들러 로드 실패: {e}")
+    # 주식 핸들러는 hermes_stock_bot.py (@Ulsan_Antigravity_bot) 전담
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(CallbackQueryHandler(handle_button_callback))

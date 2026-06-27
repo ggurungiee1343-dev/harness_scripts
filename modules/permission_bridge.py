@@ -24,11 +24,11 @@ INTERNAL_TOOLS = {
     "READ",       # [READ: /path] — 파일 내용 읽기
     "SEARCH",     # [SEARCH: query] — 웹 검색
     "WEB_READ",   # [WEB_READ: url] — URL 내용 읽기
+    "RUN_CMD",    # [RUN_CMD: bash] — bash 실행 (MJ 개인 봇, 자동 승인)
 }
 
-# EXTERNAL: 인라인 승인 필요
+# EXTERNAL: 인라인 승인 필요 (파일 변경·삭제 계열만 유지)
 EXTERNAL_TOOLS = {
-    "RUN_CMD",    # [RUN_CMD: bash] — bash 명령어 실행
     "DELETE",     # [DELETE: /path] — 파일 삭제
     "MOVE",       # [MOVE: src -> dst] — 파일 이동
     "COPY",       # [COPY: src -> dst] — 파일 복사

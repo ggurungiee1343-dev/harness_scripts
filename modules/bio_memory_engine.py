@@ -13,6 +13,14 @@ sys.path.append("/Users/bluesea/Applications/Mjauto/Scripts")
 sys.path.append("/Users/bluesea/Applications/Mjauto/Scripts/modules")
 logger = logging.getLogger("BioMemoryEngine")
 
+# SRP 분리된 모듈에서 import (2026-06-23)
+from modules.vector_engine import (
+    TurboVecLight, VectorIndexManager,
+    get_vector_backend, set_vector_backend,
+    init_vector_index, auto_bind_vim as _auto_bind_vim,
+)
+from modules.deriver_layer import ImportanceScorer, ForgettingCurve
+
 L1_TO_L2_THRESHOLD = 3.0
 L2_TO_L3_REPEAT_COUNT = 3
 FORGET_DAYS = 14
@@ -25,92 +33,7 @@ L2_MAX_BYTES = 1 * 1024 * 1024  # 1MB — 용량 기반 L3 전이 임계값
 QUERY_CACHE_TTL = 3600  # 1시간
 _query_cache: Dict[str, tuple] = {}  # {query_key: (timestamp, result)}
 
-class ImportanceScorer:
-    HIGH_WEIGHT_KEYWORDS = [
-        "오류", "에러", "버그", "수정", "긴급", "중요", "기억", "규칙",
-        "설정", "비밀번호", "토큰", "API", "포트", "경로", "PATH",
-        "실패", "복구", "치명", "항상", "절대", "반드시", "금지",
-        "박사님", "승인", "결정", "확정", "완료", "배포", "/exec"
-    ]
-    MID_WEIGHT_KEYWORDS = [
-        "일정", "작업", "TODO", "예약", "스케줄", "모듈", "스크립트",
-        "파일", "폴더", "위키", "저장", "업데이트", "변경", "추가",
-        "삭제", "이동", "생성", "분석", "검색", "질문"
-    ]
-    EMOTION_PATTERNS = [r"!{2,}", r"중요.*:", r"주의.*:", r"경고.*:", r"\[긴급\]", r"\[중요\]"]
-    TAG_RULES = {
-        "시스템": ["lm studio", "포트", "서버", "재시작", "에러", "오류"],
-        "파일작업": ["파일", "폴더", "이동", "복사", "생성", "삭제"],
-        "연구": ["논문", "연구", "분석", "데이터", "프롬프트", "claude"],
-        "트레이딩": ["주식", "매수", "매도", "rsi", "ema", "sepa", "백테스트"]
-    }
-
-    @classmethod
-    def load_config(cls, config_path: Path):
-        """설정 파일에서 동적으로 가중치 단어 목록과 태그 규칙을 불러옵니다."""
-        if config_path.exists():
-            try:
-                data = json.loads(config_path.read_text(encoding="utf-8"))
-                cls.HIGH_WEIGHT_KEYWORDS = data.get("high_weight_keywords", cls.HIGH_WEIGHT_KEYWORDS)
-                cls.MID_WEIGHT_KEYWORDS = data.get("mid_weight_keywords", cls.MID_WEIGHT_KEYWORDS)
-                cls.EMOTION_PATTERNS = data.get("emotion_patterns", cls.EMOTION_PATTERNS)
-                cls.TAG_RULES = data.get("tag_rules", cls.TAG_RULES)
-                logger.info(f"💾 [Bio-Memory] 외부 설정 로드 완료: {config_path}")
-            except Exception as e:
-                logger.error(f"⚠️ [Bio-Memory] 외부 설정 로드 실패 (기본값 사용): {e}")
-
-    @classmethod
-    def score(cls, text: str, role: str = "user") -> float:
-        score = 1.0
-        if role == "assistant": score = 0.5
-        text_lower = text.lower()
-        for kw in cls.HIGH_WEIGHT_KEYWORDS:
-            if kw.lower() in text_lower:
-                score += 2.0
-                break
-        mid_count = sum(1 for kw in cls.MID_WEIGHT_KEYWORDS if kw.lower() in text_lower)
-        score += min(mid_count * 1.0, 3.0)
-        for pat in cls.EMOTION_PATTERNS:
-            if re.search(pat, text):
-                score += 1.5
-                break
-        if len(text) > 300: score += 0.5
-        if len(text) > 800: score += 0.5
-        result = round(min(score, 10.0), 2)
-        # Model Collapse 방어 (Oxford 2305.17493): LLM 응답이 L2에 자동 승격되면
-        # 자기 응답을 재참조하는 피드백 루프 발생 → assistant는 임계값 미만으로 하드캡
-        if role == "assistant":
-            result = min(result, L1_TO_L2_THRESHOLD - 0.1)
-        return result
-
-    @classmethod
-    def extract_keywords(cls, text: str, max_kw: int = 5) -> List[str]:
-        stopwords = {"이", "그", "저", "을", "를", "이다", "있다", "하다", "않다", "것", "수", "등", "및"}
-        words = re.findall(r"[가-힣]{2,}|[A-Za-z]{3,}", text)
-        freq = {}
-        for w in words:
-            if w.lower() not in stopwords:
-                freq[w] = freq.get(w, 0) + 1
-        return sorted(freq, key=freq.get, reverse=True)[:max_kw]
-
-class ForgettingCurve:
-    STABILITY_FACTOR = 5.0
-
-    @classmethod
-    def retention(cls, importance: float, last_accessed_iso: str) -> float:
-        try: last = datetime.fromisoformat(last_accessed_iso)
-        except: last = datetime.now(timezone.utc)
-        days_elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 86400
-        stability = importance * cls.STABILITY_FACTOR
-        return round(math.exp(-days_elapsed / max(stability, 0.1)), 4)
-
-    @classmethod
-    def should_forget(cls, importance: float, last_accessed_iso: str) -> bool:
-        if importance >= FORGET_IMPORTANCE_BELOW: return False
-        try: last = datetime.fromisoformat(last_accessed_iso)
-        except: return False
-        days_elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 86400
-        return days_elapsed >= FORGET_DAYS
+# ImportanceScorer, ForgettingCurve → deriver_layer에서 import (중복 제거, 2026-06-23)
 
 class BioMemoryEngine:
     def __init__(self, vault_path: str = "/Users/bluesea/Applications/Mjobsidian"):
@@ -265,7 +188,6 @@ class BioMemoryEngine:
             "id": new_id,
             "role": role,
             # Model Collapse 방어 (Oxford 2305.17493): 출처 태깅
-            # 컨텍스트 재주입 시 human 항목 우선 보장에 사용
             "source": "human" if role == "user" else "llm",
             "content": entry["content"],
             "timestamp": entry.get("timestamp", datetime.now(timezone.utc).isoformat()),
@@ -274,8 +196,11 @@ class BioMemoryEngine:
             "access_count": 1,
             "keywords": keywords,
             "context_tags": self._generate_context_tags(entry["content"]),
+            # Memory Contagion 방어 (arXiv 2606.23195): confidence + provenance 추적
+            "confidence": min(1.0, entry.get("importance", 1.0) / 10.0),  # 0.0~1.0
+            "observation_count": 1,   # 동일 패턴 반복 관찰 시 증가 → confidence 상승
+            "provenance": entry.get("source_msg_id", None),  # 출처 메시지 ID
             # embedding은 JSON에 저장하지 않음 → turbovec 외부 인덱스 사용
-            # (State Offloading: Code as Agent Harness §3.2.6)
         }
         
         # turbovec 외부 인덱스에 임베딩 등록 (JSON 인라인 저장 대신)
@@ -508,7 +433,10 @@ class BioMemoryEngine:
             "keywords": keywords,
             "success": success,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "use_count": 0
+            "use_count": 0,
+            # Memory Contagion 방어: 성공 횟수 기반 confidence (초기 0.5, 반복 성공 시 상승)
+            "confidence": 0.5 if success else 0.2,
+            "success_count": 1 if success else 0,
         }
         l3["procedural"] = procedural
         self._save_json(self.l3_path, l3)
@@ -697,260 +625,8 @@ class BioMemoryEngine:
         return history
 
 
-# ── turbovec 경량 벡터 인덱스 옵션 ─────────────────────────
-# Parallel/supplemental vector index alongside SemanticEngine (NPU BGE-M3).
-# Configurable backend: "npu" (default), "turbovec", or "hybrid" (both -> rank fusion).
+# ── vector_engine.py로 분리됨 (2026-06-23 SRP) ────────────────────────────
+# TurboVecLight, VectorIndexManager, get/set_vector_backend, init_vector_index,
+# _auto_bind_vim → modules/vector_engine.py 참조
+# 아래 구현은 삭제됨. 상단 import에서 vector_engine을 통해 사용.
 
-import numpy as np
-
-# 외부 turbovec 모듈 시도, 실패 시 내장 간이 구현
-try:
-    from turbovec import TurboVecIndex
-    _HAS_TURBOVEC = True
-except ImportError:
-    _HAS_TURBOVEC = False
-
-VECTOR_BACKEND = "hybrid"  # "npu" | "turbovec" | "hybrid"
-VECTOR_BACKEND_CONFIG_PATH = Path("/Users/bluesea/.hermes/memory/vector_backend.json")
-
-
-class TurboVecLight:
-    """turbovec 간이 구현 — 내장 numpy 기반 경량 인덱스.
-
-    NPU SemanticEngine 병렬/대체 옵션.
-    """
-
-    def __init__(self, dim: int = 384, index_path: Path = None):
-        self.dim = dim
-        self.index_path = index_path or Path("/Users/bluesea/.hermes/memory/turbovec_index.npy")
-        self.keys_path = index_path.with_suffix(".keys.json") if index_path else Path("/Users/bluesea/.hermes/memory/turbovec_keys.json")
-        self.vectors: np.ndarray = np.empty((0, dim), dtype=np.float32)
-        self.keys: list = []
-        self._load()
-
-    def _load(self):
-        if self.index_path.exists():
-            try:
-                self.vectors = np.load(str(self.index_path))
-            except Exception:
-                self.vectors = np.empty((0, self.dim), dtype=np.float32)
-        if self.keys_path.exists():
-            try:
-                self.keys = json.loads(self.keys_path.read_text(encoding="utf-8"))
-            except Exception:
-                self.keys = []
-
-    def _save(self):
-        np.save(str(self.index_path), self.vectors)
-        self.keys_path.write_text(json.dumps(self.keys, ensure_ascii=False), encoding="utf-8")
-
-    def add(self, key: str, vector: list):
-        """벡터와 키 추가."""
-        vec = np.array(vector, dtype=np.float32).reshape(1, -1)
-        existing = [i for i, k in enumerate(self.keys) if k == key]
-        if existing:
-            idx = existing[0]
-            self.vectors[idx] = vec
-        else:
-            self.vectors = np.vstack([self.vectors, vec]) if self.vectors.size else vec
-            self.keys.append(key)
-        self._save()
-
-    def search(self, query_vec: list, top_k: int = 5) -> list:
-        """코사인 유사도 기반 검색.
-
-        Args:
-            query_vec: 질의 임베딩 벡터
-            top_k: 상위 N개
-
-        Returns:
-            [(key: str, score: float), ...]
-        """
-        if self.vectors.shape[0] == 0:
-            return []
-        qv = np.array(query_vec, dtype=np.float32).reshape(1, -1)
-        norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
-        q_norm = np.linalg.norm(qv)
-        if q_norm == 0:
-            return []
-        sims = (self.vectors @ qv.T).flatten() / (norms.flatten() * q_norm + 1e-8)
-        sims = np.nan_to_num(sims, nan=0.0)
-        top_idx = np.argsort(sims)[::-1][:top_k]
-        results = []
-        for i in top_idx:
-            if i < len(self.keys):
-                results.append((self.keys[i], float(sims[i])))
-        return results
-
-    def remove(self, key: str):
-        """키로 항목 삭제."""
-        idx = [i for i, k in enumerate(self.keys) if k == key]
-        if idx:
-            i = idx[0]
-            self.keys.pop(i)
-            self.vectors = np.delete(self.vectors, i, axis=0)
-            self._save()
-
-    def size(self) -> int:
-        return len(self.keys)
-
-
-# ── 벡터 백엔드 설정 관리 ──────────────────────────────────
-def get_vector_backend() -> str:
-    """현재 설정된 벡터 백엔드 반환."""
-    if VECTOR_BACKEND_CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(VECTOR_BACKEND_CONFIG_PATH.read_text(encoding="utf-8"))
-            return cfg.get("backend", VECTOR_BACKEND)
-        except Exception:
-            pass
-    return VECTOR_BACKEND
-
-
-def set_vector_backend(backend: str):
-    """벡터 백엔드 전환. 'npu' | 'turbovec' | 'hybrid'"""
-    global VECTOR_BACKEND
-    if backend not in ("npu", "turbovec", "hybrid"):
-        logger.warning(f"⚠️ 지원하지 않는 벡터 백엔드: {backend} (유지: {VECTOR_BACKEND})")
-        return
-    VECTOR_BACKEND = backend
-    VECTOR_BACKEND_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    VECTOR_BACKEND_CONFIG_PATH.write_text(
-        json.dumps({"backend": backend, "updated_at": datetime.now().isoformat()}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    logger.info(f"⚡ [turbovec] 벡터 백엔드 전환: {backend}")
-
-
-class VectorIndexManager:
-    """통합 벡터 인덱스 매니저 — NPU / turbovec / hybrid 통합.
-
-    GPU/CPU/온도에 따른 동적 백엔드 전환 지원.
-    """
-
-    def __init__(self, sem_engine=None, dim: int = 384):
-        self.sem_engine = sem_engine
-        self.dim = dim
-        self.turbovec = TurboVecLight(dim=dim)
-
-        # Allowlist: 그래프 후보 필터 (이 키워드가 포함된 항목만 그래프 연결)
-        self.allowlist = {
-            "에러", "버그", "오류", "수정", "복구", "긴급",
-            "설정", "경로", "포트", "토큰", "API", "PATH",
-            "승인", "결정", "규칙", "기억", "중요",
-            "확정", "완료", "배포", "실패", "치명",
-            "auto-skill", "Curator", "Honcho", "Dreaming", "turbovec",
-        }
-
-    def get_embedding(self, text: str) -> Optional[list]:
-        """백엔드 설정에 따라 임베딩 생성."""
-        backend = get_vector_backend()
-
-        npu_vec = None
-        if backend in ("npu", "hybrid") and self.sem_engine:
-            try:
-                npu_vec = self.sem_engine.get_embedding(text)
-            except Exception as e:
-                logger.warning(f"⚠️ [VectorIndex] NPU 임베딩 실패: {e}")
-
-        if backend == "turbovec":
-            # turbovec 단독 모드: 별도 임베딩 모델 필요
-            return None  # fallback to hybrid
-
-        return npu_vec
-
-    def add_to_index(self, key: str, text: str):
-        """양 백엔드에 동시 등록."""
-        backend = get_vector_backend()
-
-        if backend in ("turbovec", "hybrid"):
-            if self.sem_engine:
-                try:
-                    vec = self.sem_engine.get_embedding(text)
-                    if vec:
-                        self.turbovec.add(key, vec)
-                except Exception:
-                    pass
-
-        if backend in ("npu", "hybrid"):
-            pass  # NPU는 SemanticEngine이 직접 관리
-
-    def search(self, query: str, top_k: int = 5) -> list:
-        """통합 검색: 설정된 백엔드에 따라 검색 후 rank fusion.
-
-        Returns:
-            [(key, score), ...] (allowlist 필터링 포함)
-        """
-        backend = get_vector_backend()
-        if not self.sem_engine:
-            logger.warning("⚠️ [VectorIndex] SemanticEngine 없음, 키워드 검색 fallback")
-            return []
-
-        query_vec = self.sem_engine.get_embedding(query)
-        if not query_vec:
-            return []
-
-        results = []
-
-        if backend in ("npu", "hybrid"):
-            # NPU 검색: L2 episodic 내 임베딩 유사도
-            pass  # 호출 측에서 처리
-
-        if backend in ("turbovec", "hybrid"):
-            tv_results = self.turbovec.search(query_vec, top_k=top_k * 2)
-            results.extend(tv_results)
-
-        # allowlist 필터링: 그래프 연결 후보는 allowlist 키워드 포함 항목만
-        filtered = []
-        for key, score in results:
-            # 키 또는 내용에 allowlist 키워드 포함 여부
-            if any(kw in key.lower() for kw in self.allowlist):
-                filtered.append((key, score))
-            else:
-                filtered.append((key, score * 0.3))  # 비허용 리스트는 감점
-
-        # Sort by score descending, take top_k
-        filtered.sort(key=lambda x: x[1], reverse=True)
-        return filtered[:top_k]
-
-    def is_allowlisted(self, key: str) -> bool:
-        """그래프 후보 자격 확인."""
-        return any(kw in key.lower() for kw in self.allowlist)
-
-
-# ── BioMemoryEngine.vim 자동 바인딩 (모듈 로드 완료 후 실행) ────────────
-# VectorIndexManager가 BioMemoryEngine보다 나중에 정의되므로 모듈 레벨에서 패치
-def _auto_bind_vim(engine: "BioMemoryEngine"):
-    """BioMemoryEngine 인스턴스에 VectorIndexManager를 자동 바인딩.
-
-    __init__에서 vim=None으로 초기화 후, 모듈 완전 로드 이후 이 함수를 통해
-    VectorIndexManager를 연결. harness_agent.py의 LazyService 패턴과 호환.
-    """
-    if engine.sem_engine and engine.vim is None:
-        try:
-            engine.vim = VectorIndexManager(sem_engine=engine.sem_engine)
-            logger.info(f"⚡ [Bio-Memory] VectorIndexManager 자동 바인딩 완료")
-            # 이미 인라인 임베딩이 있으면 turbovec으로 이관
-            engine._strip_inline_embeddings()
-        except Exception as e:
-            logger.warning(f"[Bio-Memory] vim 자동 바인딩 실패: {e}")
-
-
-# ── BioMemoryEngine 확장 메서드 ─────────────────────────────
-def init_vector_index(engine: BioMemoryEngine):
-    """BioMemoryEngine에 VectorIndexManager 연결.
-
-    기존 sem_engine를 공유하며 turbovec 병렬 운용.
-
-    Usage:
-        vim = init_vector_index(bio_engine)
-        # 이후 bio_engine.vim 으로 접근
-    """
-    if engine.sem_engine:
-        vim = VectorIndexManager(sem_engine=engine.sem_engine)
-        engine.vim = vim
-        backend = get_vector_backend()
-        logger.info(f"⚡ [VectorIndex] 초기화 완료 (백엔드: {backend}, allowlist={len(vim.allowlist)}개)")
-        return vim
-    logger.warning("⚠️ [VectorIndex] SemanticEngine 없음 — VectorIndex 미초기화")
-    return None

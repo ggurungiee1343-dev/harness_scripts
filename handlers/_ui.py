@@ -96,9 +96,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '• <code>/memory</code> — L1/L2/L3 메모리 3계층 상태 조회\n'
         '• <code>/memory health</code> — 메모리 정제 상태 (보유율/forget 대상)\n'
         '• <code>/memory forget</code> — 소멸 대상 확인 (dry-run) / <code>confirm</code>으로 실행\n'
-        '• <code>/dreaming</code> — 대화/작업 → Journal/Memory/hot.md 자동 분배 (L3 성장)\n'
+        '• <code>/dreaming</code> — raw 이벤트 → Journal·L3 semantic 지식 증류 (미처리 이벤트 있을 때만 LLM 호출)\n'
+        '• <code>/memory_dream</code> — /dreaming 별칭 (같은 동작)\n'
         '• <code>/clip [내용]</code> — 텍스트를 Clippings 폴더에 .md로 즉시 저장\n'
-        '• <code>/goal [목표]</code> — 장기 목표 설정 (Dreaming 시 헌법과 함께 감사)\n\n'
+        '• <code>/goal [목표]</code> — 장기 목표 설정 / <code>clear</code>로 삭제 / 인수 없이 현재 목표 조회\n\n'
 
         '📈 <b>주식 분석 (V_FINAL 전략)</b>\n'
         '• <code>/market</code> — 시장 상태 (NASDAQ/VIX/섹터 3중 필터)\n'

@@ -208,6 +208,93 @@ class WeaknessMiner:
         except Exception as e:
             log.warning(f"에러보고서 기록 실패: {e}")
 
+    # ── Skill Coverage 측정 (arXiv 2606.20659) ──────────────
+    def record_skill_invocation(self, skill_name: str):
+        """스킬 호출 기록 — 커버리지 측정용."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS skill_invocations (
+                    skill_name TEXT NOT NULL,
+                    invoked_at REAL NOT NULL
+                )
+            """)
+            conn.execute(
+                "INSERT INTO skill_invocations (skill_name, invoked_at) VALUES (?, ?)",
+                (skill_name, time.time())
+            )
+            conn.commit()
+
+    def get_skill_coverage(self) -> dict:
+        """등록된 스킬 vs 실제 호출된 스킬 커버리지 반환."""
+        import glob
+        skill_dirs = [
+            os.path.expanduser("~/.hermes/skills"),
+            os.path.expanduser("~/.claude/skills"),
+        ]
+        all_skills = set()
+        for sd in skill_dirs:
+            for path in glob.glob(f"{sd}/*/SKILL.md"):
+                skill_name = os.path.basename(os.path.dirname(path))
+                all_skills.add(skill_name)
+
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT DISTINCT skill_name FROM skill_invocations"
+                ).fetchall()
+                invoked = {r[0] for r in rows}
+            except Exception:
+                invoked = set()
+
+        covered = all_skills & invoked
+        never_called = all_skills - invoked
+        ratio = len(covered) / len(all_skills) if all_skills else 0.0
+        return {
+            "total": len(all_skills),
+            "covered": len(covered),
+            "never_called": sorted(never_called),
+            "ratio": round(ratio, 2),
+        }
+
+    # ── SkillHarness 안전성 검증 (arXiv 2606.20636) ─────────
+    def validate_skill_safety(self) -> dict:
+        """SKILL.md 파일에 안전 제약이 포함됐는지 검사.
+
+        Returns:
+            {total, safe, unsafe_skills: [{name, path, missing}]}
+        """
+        import glob, re
+        skill_dirs = [
+            os.path.expanduser("~/.hermes/skills"),
+            os.path.expanduser("~/.claude/skills"),
+        ]
+        safety_keywords = re.compile(
+            r"(금지|위험|제한|forbidden|unsafe|lock.?stack|do.?not|주의|경고|warning|caution)",
+            re.IGNORECASE
+        )
+        results = {"total": 0, "safe": 0, "unsafe_skills": []}
+        for sd in skill_dirs:
+            for skill_md in glob.glob(f"{sd}/*/SKILL.md"):
+                skill_name = os.path.basename(os.path.dirname(skill_md))
+                results["total"] += 1
+                try:
+                    content = open(skill_md, encoding="utf-8").read()
+                    if safety_keywords.search(content):
+                        results["safe"] += 1
+                    else:
+                        results["unsafe_skills"].append({
+                            "name": skill_name,
+                            "path": skill_md,
+                            "missing": "안전 제약 키워드 없음",
+                        })
+                except Exception as e:
+                    results["unsafe_skills"].append({
+                        "name": skill_name,
+                        "path": skill_md,
+                        "missing": f"읽기 실패: {e}",
+                    })
+        return results
+
     # ── 현황 조회 ────────────────────────────────────────────
     def get_top_failures(self, days: int = 7, top_n: int = 5) -> list:
         """최근 N일 내 가장 많이 반복된 실패 패턴 반환."""

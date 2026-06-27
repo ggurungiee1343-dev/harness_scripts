@@ -61,8 +61,19 @@ async def handle_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text(f'❌ 취소 처리 실패: {e}')
         return
 
+    # === MJstock 스캔 결과 보기 콜백 ===
+    # callback_data 형식: mjstock_results__검색기키__YYYYMMDD
+    if data.startswith('mjstock_results__'):
+        try:
+            from handlers._stock import callback_mjstock_results
+            await callback_mjstock_results(update, context)
+        except Exception as e:
+            logger.error(f'mjstock_results 콜백 오류: {e}')
+            await query.answer('❌ 결과 파일 생성 실패')
+        return
+
     # === MJstock 단일 종목 검색식 콜백 ===
-    if data.startswith('mjstock:'):
+    if data.startswith('mjstock:') or data.startswith('mjstock_all:') or data.startswith('mjstock_chart:'):
         try:
             from handlers._stock import callback_mjstock
             await callback_mjstock(update, context)

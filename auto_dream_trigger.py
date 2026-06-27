@@ -58,6 +58,74 @@ def pending_count() -> tuple:
     return total, last, max(0, total - last)
 
 
+def write_changelog():
+    """
+    nightly changelog loop — 전날 변경사항을 wiki/00_Meta/CHANGELOG.md 에 자동 기록.
+    auto_dream.log 에서 오늘 날짜 이전 항목을 파싱해 요약한다.
+    """
+    WIKI_DIR    = Path.home() / "Applications" / "Mjobsidian" / "wiki" / "00_Meta"
+    CHANGELOG   = WIKI_DIR / "CHANGELOG.md"
+    HOT_MD      = WIKI_DIR / "01_hot.md"
+    SYS_STATE   = WIKI_DIR / "05_시스템 상태.md"
+
+    today   = datetime.now().strftime("%Y-%m-%d")
+    entries = []
+
+    # 1. auto_dream.log — 오늘 완료 항목
+    try:
+        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        dream_lines = [l for l in lines if today in l and "완료" in l]
+        if dream_lines:
+            entries.append(f"- 🌙 Dreaming: {dream_lines[-1].split(']')[-1].strip()}")
+    except Exception:
+        pass
+
+    # 2. 05_시스템 상태.md — 오늘 날짜 포함 줄 (✅ 완료 항목)
+    try:
+        state_lines = SYS_STATE.read_text(encoding="utf-8", errors="replace").splitlines()
+        for l in state_lines:
+            if today in l and ("✅" in l or "완료" in l):
+                clean = l.strip().lstrip("#- |✅").strip()
+                if clean:
+                    entries.append(f"- ✅ {clean}")
+    except Exception:
+        pass
+
+    # 3. 01_hot.md — 오늘 날짜 포함 줄
+    try:
+        hot_lines = HOT_MD.read_text(encoding="utf-8", errors="replace").splitlines()
+        for l in hot_lines:
+            if today in l and l.strip():
+                clean = l.strip().lstrip("#- |✅📌").strip()
+                if clean and len(clean) > 10:
+                    entries.append(f"- 📌 {clean}")
+    except Exception:
+        pass
+
+    if not entries:
+        log("changelog: 오늘 변경사항 없음 — 스킵")
+        return
+
+    # CHANGELOG.md 없으면 생성
+    WIKI_DIR.mkdir(parents=True, exist_ok=True)
+    if not CHANGELOG.exists():
+        CHANGELOG.write_text("# Hermes Changelog\n\n", encoding="utf-8")
+
+    existing = CHANGELOG.read_text(encoding="utf-8")
+
+    # 이미 오늘 날짜 항목 있으면 덮어쓰기 방지
+    if f"## {today}" in existing:
+        log(f"changelog: {today} 이미 존재 — 스킵")
+        return
+
+    # atomic write
+    new_section = f"\n## {today}\n\n" + "\n".join(entries) + "\n"
+    tmp = CHANGELOG.with_suffix(".tmp")
+    tmp.write_text(existing.rstrip() + new_section, encoding="utf-8")
+    tmp.rename(CHANGELOG)
+    log(f"changelog: {len(entries)}건 기록 완료 → {CHANGELOG}")
+
+
 def notify(msg: str):
     try:
         subprocess.run(
@@ -140,6 +208,12 @@ def main():
         log(f"실패: {e}")
         notify(f"❌ 자동 Dreaming 실패: {e}")
         sys.exit(1)
+
+    # nightly changelog — dreaming 성공 후 기록
+    try:
+        write_changelog()
+    except Exception as e:
+        log(f"changelog 기록 실패(무시): {e}")
 
 
 if __name__ == "__main__":

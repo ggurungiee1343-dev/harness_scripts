@@ -105,6 +105,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         report += f'🩺 **건강 상태:** {"✅ 정상" if health_ok else "⚠️ 주의"}\n'
         report += f'{health_msg}\n\n'
 
+        # 스킬 커버리지 (arXiv 2606.20659)
+        try:
+            cov = get_weakness_miner().get_skill_coverage()
+            pct = int(cov["ratio"] * 100)
+            cov_icon = "✅" if pct >= 70 else ("⚠️" if pct >= 40 else "🔴")
+            report += f'{cov_icon} **스킬 커버리지:** {pct}% ({cov["covered"]}/{cov["total"]}개 호출됨)\n'
+            if cov["never_called"]:
+                never_str = ", ".join(f"`{s}`" for s in cov["never_called"][:5])
+                report += f'   └─ 미호출: {never_str}\n'
+            report += '\n'
+        except Exception:
+            pass
+
         # 핫토픽 파일 확인
         status_file = os.path.join(BASE_DIR, '..', 'wiki', '00_Meta', 'hot.md')
         status_file = os.path.abspath(status_file)

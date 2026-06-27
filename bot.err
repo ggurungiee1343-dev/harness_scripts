@@ -1,0 +1,27 @@
+INFO:ActionRealization:[ActionRealizationLayer] 🛡️ 초기화 완료 — 11개 Validator 등록
+INFO:ActionRealization:  └─ validator: bash_exec
+INFO:ActionRealization:  └─ validator: file_create
+INFO:ActionRealization:  └─ validator: file_delete
+INFO:ActionRealization:  └─ validator: file_list
+INFO:ActionRealization:  └─ validator: file_move_copy
+INFO:ActionRealization:  └─ validator: file_read
+INFO:ActionRealization:  └─ validator: file_rename
+INFO:ActionRealization:  └─ validator: ingest
+INFO:ActionRealization:  └─ validator: paper_search
+INFO:ActionRealization:  └─ validator: search
+INFO:ActionRealization:  └─ validator: url
+INFO:dialectic.fts:📊 ctx_summary_fts: 0개 문서 인덱싱 완료
+INFO:dialectic.fts:📊 decisions_fts: 0개 문서 인덱싱 완료
+INFO:dialectic.fts:📊 handoffs_fts: 0개 문서 인덱싱 완료
+INFO:dialectic.fts:✅ FTS5 인덱스 초기 구축 완료
+INFO:sia_engine:[SIA] 피드백 DB 초기화: /Users/bluesea/.hermes/runtime/sia_feedback.db
+INFO:monitoring_engine:[Monitoring] 메트릭 DB 초기화: /Users/bluesea/.hermes/runtime/metrics.db
+INFO:load_balancer:[LoadBalancer] 모델 메트릭 DB 초기화: /Users/bluesea/.hermes/runtime/model_metrics.db
+INFO:PolicyEngine:정책 로드 완료: hermes_policy.yaml (5개 규칙)
+INFO:PolicyEngine:정책 로드 완료: hermes_policy.yaml (5개 규칙)
+INFO:ActionRealization:[ActionRealizationLayer] 🛡️ Policy Engine 런타임 연결됨
+INFO:HermesOrchestrator:✅ [v8.9 아키텍처] Dreaming v2.0(SKILLOPT+FluxMem 융합형) 이벤트 기반 버스 바인딩 완결.
+INFO:HermesOrchestrator:✅ [v8.6 아키텍처] DB 레이어와 지식 캐스케이드 간의 Pub-Sub 동적 버스 결합 성공.
+INFO:HermesOrchestrator:✅ 주식 분석 핸들러 등록 완료 (V_FINAL + 피드백 루프)
+INFO:apscheduler.scheduler:Scheduler started
+INFO:telegram.ext.Application:Application started

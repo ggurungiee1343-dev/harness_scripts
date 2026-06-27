@@ -1,7 +1,12 @@
 """
-_meta.py — /claude_brief 명령어 핸들러 (간소화)
+_meta.py — /claude_brief, /save_wiki, /wiki_lint 핸들러
 ========================================
-4대 메타 문서에서 필요한 정보만 추출하여 claude_briefing.md 생성 후 텔레그램 전송.
+기존:
+  /claude_brief — 4대 메타 문서 브리핑 생성
+
+🆕 추가:
+  /save_wiki [경로] — 현재 대화 마지막 분석을 wiki 페이지로 저장
+  /wiki_lint        — wiki 고아/오래된/깨진링크/빈 페이지 탐지
 
 자동 스캔 항목 제외:
   ❌ constitution.local.md (세션 시작 시 자동 스캔)
@@ -14,8 +19,11 @@ _meta.py — /claude_brief 명령어 핸들러 (간소화)
   ✅ HERMES3_MASTER_DEVELOPMENT_GUIDE.md
 """
 import os
+import re
 import logging
 from pathlib import Path
+from datetime import datetime
+
 from telegram import Update
 from telegram.ext import ContextTypes
 from handlers._base import safe_reply, safe_edit
@@ -23,10 +31,11 @@ from handlers._base import safe_reply, safe_edit
 logger = logging.getLogger('HermesOrchestrator')
 
 # ============================================================
-# 경로 상수 (간소화됨)
+# 경로 상수
 # ============================================================
 META_DIR = Path("/Users/bluesea/Applications/Mjobsidian/wiki/00_Meta")
 OUTPUT_FILE = META_DIR / "claude_briefing.md"
+WIKI_ROOT   = Path("/Users/bluesea/Applications/Mjobsidian/wiki")
 
 _MAX_FILE_SIZE = 50 * 1024  # 50KB
 
@@ -35,7 +44,6 @@ _MAX_FILE_SIZE = 50 * 1024  # 50KB
 # 파일 읽기 헬퍼
 # ============================================================
 def _read_file(path: Path) -> str:
-    """파일 읽기, 없으면 빈 문자열"""
     if not path.exists():
         return ""
     try:
@@ -46,16 +54,14 @@ def _read_file(path: Path) -> str:
 
 
 # ============================================================
-# 섹션별 추출 함수
+# 섹션별 추출 함수 (기존 유지)
 # ============================================================
 def _extract_system_status(text: str) -> str:
-    """05_시스템 상태.md → 최신 25줄"""
     lines = text.strip().split("\n")
     return "\n".join(lines[-25:])
 
 
 def _extract_defects(text: str) -> str:
-    """시스템_구조적_결함_분석.md → 미해결 항목만"""
     lines = text.split("\n")
     result = []
     for line in lines:
@@ -66,7 +72,6 @@ def _extract_defects(text: str) -> str:
 
 
 def _extract_memory_spec(text: str) -> str:
-    """메모리_파일_명세서.md → L1/L2/L3 라인만, 최대 12줄"""
     lines = text.split("\n")
     result = []
     for line in lines:
@@ -77,19 +82,15 @@ def _extract_memory_spec(text: str) -> str:
 
 
 def _extract_dev_guide(text: str) -> str:
-    """HERMES3_MASTER_DEVELOPMENT_GUIDE.md → 버전 + 진행 중 항목, 최대 15줄"""
     lines = text.split("\n")
     result = []
     version_line = ""
     for line in lines:
         stripped = line.strip()
-        # 버전 번호 라인
         if "버전" in stripped or ("v" in stripped.lower() and any(c.isdigit() for c in stripped)):
             version_line = line
-        # 진행 중, 예정, 미완료, [ ]
         if any(kw in stripped for kw in ["진행 중", "예정", "미완료", "[ ]"]):
             result.append(line)
-
     output = ""
     if version_line:
         output += version_line + "\n"
@@ -98,99 +99,58 @@ def _extract_dev_guide(text: str) -> str:
 
 
 # ============================================================
-# 브리핑 생성 (간소화됨)
+# 브리핑 생성 (기존 유지)
 # ============================================================
 def _generate_briefing() -> tuple:
-    """
-    claude_briefing.md 생성 (4개 파일만)
-    Returns: (content: str, success_count: int, missing: list)
-    """
     now = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")
-
     sections = {}
     missing = []
 
-    # 1. 05_시스템 상태.md
-    path = META_DIR / "05_시스템 상태.md"
-    text = _read_file(path)
-    if text:
-        sections["system_status"] = _extract_system_status(text)
-    else:
-        sections["system_status"] = None
-        missing.append("05_시스템 상태.md")
-
-    # 2. 시스템_구조적_결함_분석.md
-    path = META_DIR / "시스템_구조적_결함_분석.md"
-    text = _read_file(path)
-    if text:
-        sections["defects"] = _extract_defects(text)
-    else:
-        sections["defects"] = None
-        missing.append("시스템_구조적_결함_분석.md")
-
-    # 3. 메모리_파일_명세서.md
-    path = META_DIR / "메모리_파일_명세서.md"
-    text = _read_file(path)
-    if text:
-        sections["memory_spec"] = _extract_memory_spec(text)
-    else:
-        sections["memory_spec"] = None
-        missing.append("메모리_파일_명세서.md")
-
-    # 4. HERMES3_MASTER_DEVELOPMENT_GUIDE.md
-    path = META_DIR / "HERMES3_MASTER_DEVELOPMENT_GUIDE.md"
-    text = _read_file(path)
-    if text:
-        sections["dev_guide"] = _extract_dev_guide(text)
-    else:
-        sections["dev_guide"] = None
-        missing.append("HERMES3_MASTER_DEVELOPMENT_GUIDE.md")
+    for key, filename, extractor in [
+        ("system_status", "05_시스템 상태.md",                _extract_system_status),
+        ("defects",       "시스템_구조적_결함_분석.md",        _extract_defects),
+        ("memory_spec",   "메모리_파일_명세서.md",             _extract_memory_spec),
+        ("dev_guide",     "HERMES3_MASTER_DEVELOPMENT_GUIDE.md", _extract_dev_guide),
+    ]:
+        text = _read_file(META_DIR / filename)
+        if text:
+            sections[key] = extractor(text)
+        else:
+            sections[key] = None
+            missing.append(filename)
 
     success_count = 4 - len(missing)
 
-    # ── 출력 파일 조립 ──
-    lines = []
-    lines.append("# Hermes Claude Briefing")
-    lines.append(f"생성일시: {now}")
-    lines.append(f"버전: Hermes v9.2")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-
-    # 참고 사항
-    lines.append("## 📌 참고")
-    lines.append("이 파일은 즉시 참조 용도입니다.")
-    lines.append("- **constitution.local.md** — 세션 시작 시 자동 스캔")
-    lines.append("- **01_hot.md** — 세션 시작 시 자동 스캔")
-    lines.append("")
-
-    # 현재 시스템 상태
-    lines.append("## 🖥️ 현재 시스템 상태")
-    lines.append(sections.get("system_status") or "[05_시스템 상태.md 누락]")
-    lines.append("")
-
-    # 미해결 버그/장애
-    lines.append("## 🚨 미해결 버그/장애")
-    lines.append(sections.get("defects") or "[시스템_구조적_결함_분석.md 누락]")
-    lines.append("")
-
-    # 메모리 현황
-    lines.append("## 🧠 메모리 현황")
-    lines.append(sections.get("memory_spec") or "[메모리_파일_명세서.md 누락]")
-    lines.append("")
-
-    # 개발 로드맵
-    lines.append("## 🗺️ 개발 로드맵 (진행 중)")
-    lines.append(sections.get("dev_guide") or "[HERMES3_MASTER_DEVELOPMENT_GUIDE.md 누락]")
-    lines.append("")
-
-    lines.append("---")
-    lines.append("*이 파일은 /claude_brief 명령어로 자동 생성됩니다.*")
-    lines.append("*Claude 새 대화 시작 시 이 파일을 첨부하세요.*")
+    lines = [
+        "# Hermes Claude Briefing",
+        f"생성일시: {now}",
+        "버전: Hermes v9.2",
+        "",
+        "---",
+        "",
+        "## 📌 참고",
+        "이 파일은 즉시 참조 용도입니다.",
+        "- **constitution.local.md** — 세션 시작 시 자동 스캔",
+        "- **01_hot.md** — 세션 시작 시 자동 스캔",
+        "",
+        "## 🖥️ 현재 시스템 상태",
+        sections.get("system_status") or "[05_시스템 상태.md 누락]",
+        "",
+        "## 🚨 미해결 버그/장애",
+        sections.get("defects") or "[시스템_구조적_결함_분석.md 누락]",
+        "",
+        "## 🧠 메모리 현황",
+        sections.get("memory_spec") or "[메모리_파일_명세서.md 누락]",
+        "",
+        "## 🗺️ 개발 로드맵 (진행 중)",
+        sections.get("dev_guide") or "[HERMES3_MASTER_DEVELOPMENT_GUIDE.md 누락]",
+        "",
+        "---",
+        "*이 파일은 /claude_brief 명령어로 자동 생성됩니다.*",
+        "*Claude 새 대화 시작 시 이 파일을 첨부하세요.*",
+    ]
 
     content = "\n".join(lines)
-
-    # 50KB 제한: 초과 시 간소화
     if len(content.encode("utf-8")) > _MAX_FILE_SIZE:
         content = _truncate_to_size(content)
 
@@ -198,13 +158,11 @@ def _generate_briefing() -> tuple:
 
 
 def _truncate_to_size(content: str, max_bytes: int = _MAX_FILE_SIZE) -> str:
-    """50KB 초과 시 각 섹션을 균등하게 축소"""
     sections_inner = content.split("\n## ")
     result = [sections_inner[0]]
     for sec in sections_inner[1:]:
         lines = sec.split("\n")
         if len(lines) > 10:
-            # 요약: 처음 2줄(헤더) + 핵심 5줄
             sec_header = lines[:2]
             sec_body = lines[2:]
             non_empty = [l for l in sec_body if l.strip()]
@@ -212,24 +170,19 @@ def _truncate_to_size(content: str, max_bytes: int = _MAX_FILE_SIZE) -> str:
             result.append("\n".join(sec_header + keep))
         else:
             result.append(sec)
-
     truncated = "\n## ".join(result)
-    # 그래도 초과하면 더 축소
     if len(truncated.encode("utf-8")) > max_bytes:
         truncated = truncated[:int(len(truncated) * 0.6)]
     return truncated
 
 
 # ============================================================
-# 텔레그램 핸들러
+# 기존 핸들러
 # ============================================================
 async def cmd_claude_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/claude_brief` — 4대 메타 문서 브리핑 생성"""
-    # 승인 확인 없이 바로 실행 (읽기 전용 작업)
-
     content, success_count, missing = _generate_briefing()
 
-    # 파일 쓰기
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_FILE.write_text(content, encoding="utf-8")
 
@@ -254,3 +207,106 @@ async def cmd_claude_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     await safe_reply(update.message, msg)
+
+
+# ============================================================
+# 🆕 /save_wiki 핸들러
+# ============================================================
+async def cmd_save_wiki(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    `/save_wiki [경로]` — 직전 대화 분석 결과를 wiki 페이지로 저장.
+
+    사용법:
+        /save_wiki                        → 자동 경로 (분석/YYYYMMDD_HHMMSS.md)
+        /save_wiki 주식분석/RDW전략.md    → 지정 경로
+        /save_wiki 주식분석/RDW전략.md --overwrite
+
+    LLM이 SAVE 태그로 내용을 지정하는 경우:
+        harness_agent.py의 SAVE 태그 처리 로직과 연계 가능.
+        context.user_data["last_save_content"] 에 내용이 있으면 사용.
+    """
+    from modules.wiki_manager import WikiManager  # 런타임 임포트 (순환 방지)
+
+    args = context.args or []
+    overwrite = "--overwrite" in args
+    path_args = [a for a in args if not a.startswith("--")]
+
+    # 경로 결정
+    if path_args:
+        rel_path = path_args[0]
+        # .md 확장자 없으면 추가
+        if not rel_path.endswith(".md"):
+            rel_path += ".md"
+    else:
+        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rel_path = f"분석/{now_str}.md"
+
+    # 저장할 내용 결정
+    # 1순위: context.user_data에 LLM이 남긴 내용
+    # 2순위: 직전 봇 메시지 (chat history에서 가져오기 어려워 안내만)
+    content = context.user_data.get("last_save_content", "")
+
+    if not content:
+        # 내용이 없으면 사용법 안내
+        await safe_reply(
+            update.message,
+            "📝 *저장할 내용이 없습니다.*\n\n"
+            "사용법:\n"
+            "1️⃣ LLM에게 분석 요청 후 `[SAVE]내용[/SAVE]` 태그로 감싸달라고 하세요.\n"
+            "2️⃣ 또는 텍스트를 직접 입력 후 `/save_wiki 경로` 실행:\n"
+            "`/save_wiki 주식분석/RDW분석.md`\n\n"
+            "LLM이 분석한 내용에 SAVE 태그가 포함되면 자동으로 저장됩니다."
+        )
+        return
+
+    wm = WikiManager()
+    result = wm.write_wiki(rel_path, content, overwrite=overwrite)
+
+    if result["ok"]:
+        # 저장 후 context 초기화
+        context.user_data.pop("last_save_content", None)
+        size_kb = len(content.encode("utf-8")) / 1024
+        await safe_reply(
+            update.message,
+            f"✅ *Wiki 저장 완료*\n\n"
+            f"• 경로: `wiki/{rel_path}`\n"
+            f"• 크기: {size_kb:.1f}KB\n"
+            f"• index.md 자동 갱신 완료\n\n"
+            f"Obsidian에서 바로 확인 가능합니다."
+        )
+    else:
+        await safe_reply(update.message, result["msg"])
+
+
+# ============================================================
+# 🆕 /wiki_lint 핸들러
+# ============================================================
+async def cmd_wiki_lint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    `/wiki_lint [일수]` — wiki 건강 상태 점검.
+
+    사용법:
+        /wiki_lint        → 30일 기준
+        /wiki_lint 60     → 60일 기준 stale 탐지
+    """
+    from modules.wiki_manager import WikiManager
+
+    args = context.args or []
+    stale_days = 30
+    if args:
+        try:
+            stale_days = int(args[0])
+        except ValueError:
+            pass
+
+    await safe_reply(update.message, f"🔍 Wiki Lint 실행 중... (stale 기준: {stale_days}일)")
+
+    wm = WikiManager()
+    try:
+        result = wm.lint_wiki(stale_days=stale_days)
+    except Exception as e:
+        logger.error(f"[wiki_lint] 오류: {e}", exc_info=True)
+        await safe_reply(update.message, f"❌ Lint 실행 오류: {e}")
+        return
+
+    await safe_reply(update.message, result["summary"])

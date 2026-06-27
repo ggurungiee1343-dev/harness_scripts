@@ -178,14 +178,26 @@ async def cmd_restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await safe_edit(msg, f"❌ 에러: {BOT_PLIST} 를 찾을 수 없습니다.")
         return
 
-    await safe_edit(msg, "🔁 <b>Bot 재시작 명령 전송됨</b>\nlaunchctl unload / load 명령을 실행합니다.", parse_mode='HTML')
+    await safe_edit(msg, "🔁 <b>Bot 재시작 명령 전송됨</b>\n현재 프로세스 종료 후 nohup으로 재실행합니다.", parse_mode='HTML')
 
-    # 봇이 죽기 전에 응답을 먼저 보내고 재시작 실행
-    import asyncio
+    import asyncio, os, signal
+    SCRIPTS = str(Path.home() / "Applications/Mjauto/Scripts")
+    PYTHON  = "/usr/local/bin/python3"
+
     async def _restart_routine():
         await asyncio.sleep(1)
-        subprocess.run(["launchctl", "unload", "-w", str(BOT_PLIST)], capture_output=True)
-        subprocess.run(["launchctl", "load", "-w", str(BOT_PLIST)], capture_output=True)
-        
+        # OLD 먼저 종료, NEW는 1초 후 시작 — 동시 실행으로 인한 Telegram 409 Conflict 방지
+        # (두 인스턴스 동시 폴링 → 신규가 Conflict 수신 → Conflict 핸들러로 신규도 사망하는 문제 수정)
+        import subprocess as sp
+        old_pid = os.getpid()
+        sp.Popen(
+            f"sleep 1 && {PYTHON} -u {SCRIPTS}/hermes_local.py"
+            f" >> {SCRIPTS}/hermes_launchd.log"
+            f" 2>> {SCRIPTS}/hermes_launchd.error.log",
+            shell=True,
+            start_new_session=True,
+        )
+        os.kill(old_pid, signal.SIGTERM)
+
     asyncio.create_task(_restart_routine())
 

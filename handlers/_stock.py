@@ -810,25 +810,88 @@ def _get_local_ip() -> str:
 
 
 async def cmd_mjstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/mjstock TICKER — 검색식 선택 후 단일 종목 분석"""
+    """/mjstock TICKER — 한국/미국 선택 후 모든 검색기 전체 분석"""
     args = context.args or []
     if not args:
         await safe_reply(update.message,
-            "📈 사용법: <code>/mjstock NVDA</code>\n"
-            "또는 한국 주식: <code>/mjstock 005930</code>",
+            "📈 사용법:\n"
+            "  <code>/mjstock NVDA</code>   — 미국 주식\n"
+            "  <code>/mjstock 005930</code> — 한국 주식\n\n"
+            "모든 검색기로 분석 후 점수 순으로 결과를 보여줍니다.",
             parse_mode="HTML")
         return
 
     ticker = args[0].upper()
+    is_kr = ticker.isdigit() and len(ticker) == 6
 
-    # 티커가 숫자면 KR 전용, 아니면 US + KR 모두 표시
-    is_kr = ticker.isdigit()
-    screeners = KR_SCREENERS if is_kr else US_SCREENERS
+    if is_kr:
+        keyboard = [[
+            InlineKeyboardButton("🇰🇷 한국 전체 검색", callback_data=f"mjstock_all:{ticker}:kr")
+        ]]
+        msg = f"📊 <b>{ticker}</b> — 한국 모든 검색기로 분석합니다"
+    else:
+        keyboard = [[
+            InlineKeyboardButton("🇺🇸 미국 전체 검색", callback_data=f"mjstock_all:{ticker}:us"),
+            InlineKeyboardButton("🇰🇷 한국으로도 검색", callback_data=f"mjstock_all:{ticker}:kr"),
+        ]]
+        msg = f"📊 <b>{ticker}</b> — 어느 시장으로 검색할까요?"
 
+    await safe_reply(update.message, msg, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+SCAN_ALL = MJSTOCK_DIR / "screener" / "scan_all_ticker.py"
+
+
+async def _handle_mjstock_all(query, ticker: str, market: str):
+    """모든 검색기 전체 분석 → 점수 순 결과 + 검색기별 버튼"""
+    flag = "🇺🇸" if market == "us" else "🇰🇷"
+    await query.edit_message_text(f"⏳ {flag} <b>{ticker}</b> 모든 검색기 분석 중...\n약 30~60초 소요됩니다.", parse_mode="HTML")
+
+    py = str(VENV_PYTHON) if VENV_PYTHON.exists() else "python3"
+
+    try:
+        proc = subprocess.run(
+            [py, str(SCAN_ALL), "--ticker", ticker, "--market", market],
+            capture_output=True, text=True,
+            cwd=str(MJSTOCK_DIR / "screener"),
+            timeout=120,
+        )
+        res = json.loads(proc.stdout.strip())
+    except subprocess.TimeoutExpired:
+        await query.edit_message_text("⏱ 타임아웃 (120초 초과)")
+        return
+    except Exception as e:
+        await query.edit_message_text(f"❌ 오류: {e}\n{proc.stderr[:200] if 'proc' in dir() else ''}")
+        return
+
+    if not res.get("ok"):
+        await query.edit_message_text(f"❌ {res.get('error', '분석 실패')}")
+        return
+
+    results = res["results"]
+    if not results:
+        await query.edit_message_text(f"❌ {ticker} — 결과 없음")
+        return
+
+    # 결과 텍스트 (점수 순)
+    lines = [f"{flag} <b>{ticker}</b> — 검색기 전체 분석 결과\n"]
+    for i, r in enumerate(results[:8], 1):
+        icon_pass = "✅" if r["pass"] else "❌"
+        filled = round(r["score"] / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        lines.append(f"{i}. {r['icon']} <b>{r['name']}</b>  {r['score']:.0f}점 {icon_pass}")
+        lines.append(f"   [{bar}]")
+
+    lines.append("\n▼ 검색기를 눌러 차트 확인")
+
+    # 인라인 버튼: 상위 결과 (검색기명 + 점수 + 통과여부)
     keyboard = []
     row = []
-    for label, key in screeners:
-        btn = InlineKeyboardButton(label, callback_data=f"mjstock:{ticker}:{key}")
+    for r in results[:8]:
+        icon_pass = "✅" if r["pass"] else "❌"
+        label = f"{r['icon']} {r['name']} {r['score']:.0f}점 {icon_pass}"
+        btn = InlineKeyboardButton(label, callback_data=f"mjstock_chart:{ticker}:{r['key']}")
         row.append(btn)
         if len(row) == 2:
             keyboard.append(row)
@@ -836,36 +899,23 @@ async def cmd_mjstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row:
         keyboard.append(row)
 
-    # US 종목이면 KR 버튼 행도 추가
-    if not is_kr:
-        keyboard.append([InlineKeyboardButton("─── 한국 검색식 ───", callback_data="mjstock:noop")])
-        row = []
-        for label, key in KR_SCREENERS:
-            btn = InlineKeyboardButton(label, callback_data=f"mjstock:{ticker}:{key}")
-            row.append(btn)
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
+    # 대시보드 목록 버튼
+    ip = _get_local_ip()
+    keyboard.append([InlineKeyboardButton(
+        "📋 대시보드 목록", url=f"http://{ip}:{DASHBOARD_PORT}/"
+    )])
 
-    await safe_reply(update.message,
-        f"📊 <b>{ticker}</b> — 검색식 선택",
+    await query.edit_message_text(
+        "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard))
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
-async def callback_mjstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """인라인 버튼: mjstock:TICKER:SCREENER"""
-    query = update.callback_query
-    await query.answer()
+async def _handle_mjstock_chart(query, ticker: str, screener_key: str):
+    """검색기 버튼 클릭 → 상세 결과 + 차트 파일 첨부 (외부에서도 열림)"""
+    import glob as _glob
 
-    data = query.data  # "mjstock:NVDA:selyeok"
-    parts = data.split(":")
-    if len(parts) != 3 or parts[1] == "noop":
-        return
-
-    _, ticker, screener_key = parts
     py = str(VENV_PYTHON) if VENV_PYTHON.exists() else "python3"
 
     await query.edit_message_text(f"⏳ {ticker} × {screener_key} 분석 중...")
@@ -877,10 +927,6 @@ async def callback_mjstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cwd=str(MJSTOCK_DIR / "screener"),
             timeout=60,
         )
-        if proc.returncode != 0:
-            await query.edit_message_text(f"❌ 실행 오류\n{proc.stderr[:300]}")
-            return
-
         res = json.loads(proc.stdout.strip())
     except subprocess.TimeoutExpired:
         await query.edit_message_text("⏱ 타임아웃 (60초 초과)")
@@ -893,52 +939,236 @@ async def callback_mjstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ {res.get('error', '분석 실패')}")
         return
 
-    score = res.get("score", 0)
+    score  = res.get("score", 0)
     filled = round(score / 100 * 10)
-    bar = "█" * filled + "░" * (10 - filled)
+    bar    = "█" * filled + "░" * (10 - filled)
 
-    # bool 조건 목록
     bool_items = [(k, v) for k, v in res.items()
                   if isinstance(v, bool) and not k.startswith("exp_")]
-    cond_lines = []
-    for k, v in bool_items[:12]:
-        icon = "✅" if v else "❌"
-        cond_lines.append(f"{icon} {k}")
-
     pass_cnt  = sum(1 for _, v in bool_items if v)
     total_cnt = len(bool_items)
-
-    ip = _get_local_ip()
-    chart_url = f"http://{ip}:{DASHBOARD_PORT}/chart/{screener_key}/{ticker}"
+    cond_lines = [f"{'✅' if v else '❌'} {k}" for k, v in bool_items[:12]]
 
     lines = [
         f"📊 <b>{ticker}</b>  [{screener_key}]",
         f"",
-        f"점수: <b>{score}점</b>  [{bar}]",
+        f"점수: <b>{score:.0f}점</b>  [{bar}]",
         f"조건: {pass_cnt}/{total_cnt} 통과",
         f"",
-    ]
-    if cond_lines:
-        lines += cond_lines
-    lines += [
-        f"",
-        f"📱 차트: {chart_url}",
-    ]
+    ] + cond_lines
 
-    await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+    market = "kr" if screener_key.endswith("_kr") else "us"
+    keyboard = [[InlineKeyboardButton(
+        "← 전체 결과 목록으로",
+        callback_data=f"mjstock_all:{ticker}:{market}"
+    )]]
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+    # 차트 HTML 파일 첨부 전송 (외부에서도 열림 — 로컬 IP 링크 불필요)
+    charts_dir = MJSTOCK_DIR / "charts"
+    chart_files = sorted(_glob.glob(str(charts_dir / screener_key / f"{ticker}_farming_*.html")))
+    chart_file  = chart_files[-1] if chart_files else None
+
+    if chart_file:
+        try:
+            with open(chart_file, "rb") as f:
+                await query.message.reply_document(
+                    document=f,
+                    filename=f"{ticker}_{screener_key}.html",
+                    caption=f"📊 {ticker} [{screener_key}] 차트\n다운로드 후 브라우저로 열기",
+                )
+        except Exception:
+            pass  # 파일 전송 실패해도 텍스트 결과는 이미 전송됨
+
+
+async def callback_mjstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """mjstock 계열 인라인 버튼 통합 핸들러"""
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+
+    # 전체 검색기 분석 (새 흐름)
+    if data.startswith("mjstock_all:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            _, ticker, market = parts
+            await _handle_mjstock_all(query, ticker, market)
+        return
+
+    # 개별 검색기 차트 보기
+    if data.startswith("mjstock_chart:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            _, ticker, screener_key = parts
+            await _handle_mjstock_chart(query, ticker, screener_key)
+        return
+
+    # 기존 호환: mjstock:TICKER:SCREENER (직접 검색기 선택)
+    parts = data.split(":")
+    if len(parts) == 3 and parts[0] == "mjstock":
+        _, ticker, screener_key = parts
+        if screener_key == "noop":
+            return
+        await _handle_mjstock_chart(query, ticker, screener_key)
+        return
+
+
+# ════════════════════════════════════════════════════════════════
+# MJstock 스캔 결과 보기 콜백 (아침/장중 스캔 [결과 보기] 버튼)
+# callback_data: mjstock_results__검색기키__YYYYMMDD
+# ════════════════════════════════════════════════════════════════
+async def callback_mjstock_results(update, context) -> None:
+    query = update.callback_query
+    await query.answer("결과 파일 준비 중...")
+
+    parts = (query.data or "").split("__")
+    if len(parts) < 3:
+        await query.answer("잘못된 요청")
+        return
+
+    screener_key = parts[1]
+    date_str     = parts[2]
+
+    mjstock_dir = Path("/Users/bluesea/Applications/Mjstock")
+    html_path   = mjstock_dir / "results" / "_html" / f"results_{screener_key}_{date_str}.html"
+
+    # 없으면 실시간 생성
+    if not html_path.exists():
+        try:
+            import sys
+            sys.path.insert(0, str(mjstock_dir))
+            from generate_results_html import generate_results_html, SCREENER_NAMES
+            gen = generate_results_html(screener_key, date_str)
+            if gen and gen.exists():
+                html_path = gen
+            else:
+                await query.answer("❌ 결과 없음")
+                return
+        except Exception as e:
+            logger.error(f"results HTML 생성 실패: {e}")
+            await query.answer("❌ 파일 생성 실패")
+            return
+
+    try:
+        import sys
+        sys.path.insert(0, str(mjstock_dir))
+        from generate_results_html import SCREENER_NAMES
+    except Exception:
+        SCREENER_NAMES = {}
+
+    name = SCREENER_NAMES.get(screener_key, screener_key)
+    caption = f"📊 <b>{name}</b> 결과\n{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+
+    with open(html_path, "rb") as f:
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=f,
+            filename=html_path.name,
+            caption=caption,
+            parse_mode="HTML",
+        )
+
+
+# ════════════════════════════════════════════════════════════════
+# MJstock 포지션 모니터 명령어 (POSITION_MONITOR_ENABLED=True 시 활성)
+# ════════════════════════════════════════════════════════════════
+POSITION_MONITOR_ENABLED = False  # True로 변경 시 /mjbuy /mjsell /mjpositions 활성화
+
+_MJSTOCK_DIR = Path("/Users/bluesea/Applications/Mjstock")
+
+
+async def cmd_mjbuy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mjbuy TICKER 진입가 수량 검색기키 — 포지션 매수 기록
+    예: /mjbuy AAPL 180 100 uryangju
+    """
+    if not POSITION_MONITOR_ENABLED:
+        await safe_reply(update.message, "⚠️ 포지션 모니터 비활성 상태입니다.")
+        return
+    import sys as _sys
+    _sys.path.insert(0, str(_MJSTOCK_DIR / "sellstock"))
+    from position_store import add_position
+    args = context.args or []
+    if len(args) < 4:
+        await safe_reply(update.message,
+            "사용법: /mjbuy TICKER 진입가 수량 검색기키\n예: /mjbuy AAPL 180 100 uryangju")
+        return
+    ticker, price, shares, screener = args[0], float(args[1]), int(args[2]), args[3]
+    samdoli_type = args[4] if len(args) > 4 else None
+    pos = add_position(ticker, price, shares, screener, samdoli_type=samdoli_type)
+    await safe_reply(update.message,
+        f"✅ 포지션 등록\n"
+        f"[{ticker}] {price:,.2f} × {shares}주\n"
+        f"검색기: {screener} | ID: {pos['id']}\n"
+        f"등록일: {pos['entry_date']}")
+
+
+async def cmd_mjsell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mjsell ID 청산가 — 포지션 청산 기록
+    예: /mjsell 1 195.5
+    """
+    if not POSITION_MONITOR_ENABLED:
+        await safe_reply(update.message, "⚠️ 포지션 모니터 비활성 상태입니다.")
+        return
+    import sys as _sys
+    _sys.path.insert(0, str(_MJSTOCK_DIR / "sellstock"))
+    from position_store import close_position, load_positions
+    args = context.args or []
+    if not args:
+        await safe_reply(update.message, "사용법: /mjsell ID 청산가\n예: /mjsell 1 195.5")
+        return
+    pos_id     = int(args[0])
+    exit_price = float(args[1]) if len(args) > 1 else None
+    ok = close_position(pos_id, exit_price)
+    if ok:
+        msg = f"✅ 포지션 #{pos_id} 청산 완료"
+        if exit_price:
+            msg += f"\n청산가: {exit_price:,.2f}"
+        await safe_reply(update.message, msg)
+    else:
+        await safe_reply(update.message, f"❌ 포지션 #{pos_id} 없음")
+
+
+async def cmd_mjpositions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mjpositions — 보유 포지션 목록"""
+    if not POSITION_MONITOR_ENABLED:
+        await safe_reply(update.message, "⚠️ 포지션 모니터 비활성 상태입니다.")
+        return
+    import sys as _sys
+    _sys.path.insert(0, str(_MJSTOCK_DIR / "sellstock"))
+    from position_store import get_active_positions
+    positions = get_active_positions()
+    if not positions:
+        await safe_reply(update.message, "보유 포지션 없음")
+        return
+    lines = ["📂 <b>보유 포지션</b>\n"]
+    for p in positions:
+        lines.append(
+            f"<b>[{p['ticker']}]</b> #{p['id']} — {p['screener_key']}\n"
+            f"  진입: {p['entry_price']:,.2f} × {p['shares']}주 ({p['entry_date']})"
+        )
+    await safe_reply(update.message, "\n".join(lines), parse_mode="HTML")
 
 
 # ════════════════════════════════════════════════════════════════
 # hermes_local.py 등록용 커맨드 맵
 # ════════════════════════════════════════════════════════════════
 STOCK_COMMANDS = {
-    "stock":     cmd_stock,
-    "scan":      cmd_scan,
-    "market":    cmd_market,
-    "watchlist": cmd_watchlist,
-    "positions": cmd_positions,
-    "result":    cmd_result,
-    "backtest":  cmd_backtest,
-    "mjscan":    cmd_mjscan,
-    "mjstock":   cmd_mjstock,
+    "stock":        cmd_stock,
+    "scan":         cmd_scan,
+    "market":       cmd_market,
+    "watchlist":    cmd_watchlist,
+    "positions":    cmd_positions,
+    "result":       cmd_result,
+    "backtest":     cmd_backtest,
+    "mjscan":       cmd_mjscan,
+    "mjstock":      cmd_mjstock,
+    # 포지션 모니터 명령어 (POSITION_MONITOR_ENABLED=True 시 활성)
+    "mjbuy":        cmd_mjbuy,
+    "mjsell":       cmd_mjsell,
+    "mjpositions":  cmd_mjpositions,
 }

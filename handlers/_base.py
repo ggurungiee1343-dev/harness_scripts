@@ -59,7 +59,29 @@ from hybrid_router import router
 from wiki_manager import WikiManager
 from verification_engine import verifier
 from cove_engine import cove_engine_instance  # ~/Applications/Mjauto/Scripts/cove_engine.py
-from executor import execute_bash_command
+# executor 패키지가 Python 3.14에서 `async` 예약어 충돌(SyntaxError) → 직접 구현
+async def execute_bash_command(cmd: str, timeout: int = 30) -> dict:
+    import asyncio
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return {
+            "returncode": proc.returncode,
+            "stdout": stdout.decode("utf-8", errors="replace"),
+            "stderr": stderr.decode("utf-8", errors="replace"),
+        }
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return {"returncode": -1, "stdout": "", "stderr": f"Timeout ({timeout}s)"}
+    except Exception as e:
+        return {"returncode": -1, "stdout": "", "stderr": str(e)}
 from ingest_engine import IngestEngine
 from memory_engine import MemoryEngine
 from system_monitor import SystemMonitor
@@ -73,8 +95,13 @@ from hermes_local import check_user, secure_path, history_mgr, wiki_mgr, BASE_DI
 logger = logging.getLogger('HermesOrchestrator')
 
 async def add_to_history(role: str, content: str) -> None:
-    """대화 히스토리 + Bio-Memory 동시 저장"""
+    """대화 히스토리 + Bio-Memory 동시 저장 + 포화 시 자동 압축"""
     history_mgr.add_message(role, content)
+    # 포화도 75% 이상이면 자동 압축 (세션 터지기 전 선제 대응)
+    sat = history_mgr.get_context_pressure()
+    if sat.get('warn'):
+        logger.info(f'[메모리] 포화도 {sat["ratio"]:.0%} — 자동 압축 실행')
+        history_mgr.compact_and_save()
     try:
         from hermes_memory_patch import bio_add_message
         bio_add_message(role, content)

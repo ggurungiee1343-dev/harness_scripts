@@ -24,7 +24,7 @@ SCRIPTS_DIR = Path("/Users/bluesea/Applications/Mjauto/Scripts")
 MODULES_DIR = SCRIPTS_DIR / "modules"
 HANDLERS_DIR = SCRIPTS_DIR / "handlers"
 META_DIR = Path("/Users/bluesea/Applications/Mjobsidian/wiki/00_Meta")
-DOC_FILE = META_DIR / "02_스크립트 정보.md"
+DOC_FILE = META_DIR / "02_스크립트_정보.md"
 
 MEMORY_FILES = {
     "L1 harness_memory": SCRIPTS_DIR / "harness_memory.json",

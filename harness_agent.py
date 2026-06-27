@@ -252,7 +252,7 @@ from modules.file_ops_agent import (
     _file_op_pending, is_path_allowed as _is_path_allowed,
     safe_remove as _safe_remove, handle_file_op as _handle_file_op,
 )
-from modules.context_assembler import assemble_context
+from modules.context_assembler_v2 import assemble_context
 from modules.agentic_loop import run_agentic_loop
 from modules.command_router import route_command
 from modules.response_handler import handle_llm_response

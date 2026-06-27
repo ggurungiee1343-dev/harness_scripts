@@ -1,44 +1,66 @@
 #!/bin/bash
-# check_bot_alive.sh — Hermes1 텔레그램 봇 행(hang) 감시
-# hermes_launchd.log / .error.log 가 N분 이상 갱신되지 않으면
-# (네트워크 오류 후 폴링 루프가 멈춘 채 죽지 않는 상태) 강제 재시작.
+# check_bot_alive.sh — Hermes1 텔레그램 봇 감시 & 자동 복구
 # 5분마다 launchd(com.hermes.botwatch)로 자동 실행.
+# 케이스 1: 프로세스 자체가 없음 (죽은 경우) → 즉시 재시작
+# 케이스 2: 프로세스는 있으나 하트비트 3분 이상 정지 (hang) → 강제 재시작
 
 SCRIPTS=/Users/bluesea/Applications/Mjauto/Scripts
 LABEL="com.hermes.bot"
-STALE_MIN=3   # 하트비트는 15초마다 갱신되므로 3분 정지 = 진짜 행(hang)
-
-# 하트비트 파일 우선 체크 (hermes_local.py가 폴링 루프마다 touch)
+STALE_MIN=3
 HEARTBEAT="$HOME/.hermes/runtime/bot_heartbeat"
+SEND_MSG="/usr/local/bin/python3 $SCRIPTS/send_telegram_msg.py"
 
 now=$(date +%s)
+pid=$(pgrep -f "Scripts/hermes_local.py" | head -1)
 
-if [ -f "$HEARTBEAT" ]; then
-    mtime=$(stat -f %m "$HEARTBEAT")
-else
-    mtime=0
-fi
+_restart() {
+    local reason="$1"
+    echo "[botwatch] $reason — 재시작 시도"
+    if [ -n "$pid" ]; then
+        kill -TERM "$pid" 2>/dev/null
+        for i in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    fi
+    sleep 3
+    # disabled 드리프트 차단: kickstart 전에 항상 enable 보장
+    # (서비스가 disabled로 빠지면 kickstart가 조용히 실패 → 유령 프로세스 발생)
+    launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null
+    # launchd 단일 관리로 통일 — nohup 폴백 제거(유령 프로세스 원천 차단)
+    # bootstrap이 필요한 경우(서비스 미로드)까지 커버
+    if ! launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null; then
+        echo "[botwatch] kickstart 실패 — bootstrap 재시도"
+        launchctl bootstrap "gui/$(id -u)" "/Users/bluesea/Library/LaunchAgents/$LABEL.plist" 2>/dev/null
+        launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null
+    fi
+    sleep 5
+    new_pid=$(pgrep -f "Scripts/hermes_local.py" | head -1)
+    if [ -n "$new_pid" ]; then
+        echo "[botwatch] 복구 성공 (PID $new_pid)"
+        $SEND_MSG "🔄 [botwatch] Hermes1 자동 복구 완료 (PID $new_pid) — 사유: $reason" 2>/dev/null
+    else
+        echo "[botwatch] 복구 실패"
+        $SEND_MSG "❌ [botwatch] Hermes1 복구 실패 — 수동 확인 필요" 2>/dev/null
+    fi
+}
 
-if [ "$mtime" -eq 0 ]; then
+# 케이스 1: 프로세스 없음 → 즉시 재시작
+if [ -z "$pid" ]; then
+    _restart "프로세스 없음(봇 다운)"
     exit 0
 fi
 
-age_min=$(( (now - mtime) / 60 ))
-pid=$(pgrep -f "Scripts/hermes_local.py" | head -1)
-
-if [ "$age_min" -ge "$STALE_MIN" ] && [ -n "$pid" ]; then
-    echo "[봇 행 감시] 하트비트 ${age_min}분 정지 (PID=$pid). 재시작."
-
-    # SIGTERM 먼저 — SIGKILL은 텔레그램 서버측 잔여 연결 유발로 Conflict 루프 위험
-    kill -TERM "$pid" 2>/dev/null
-    for i in 1 2 3 4 5; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 1
-    done
-    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-
-    sleep 5
-    launchctl kickstart -k "gui/501/$LABEL"
+# 케이스 2: 하트비트 파일로 hang 감지
+if [ -f "$HEARTBEAT" ]; then
+    mtime=$(stat -f %m "$HEARTBEAT")
+    age_min=$(( (now - mtime) / 60 ))
+    if [ "$age_min" -ge "$STALE_MIN" ]; then
+        _restart "하트비트 ${age_min}분 정지(hang)"
+        exit 0
+    fi
+    echo "✅ Hermes1 정상 (PID=$pid, 하트비트 ${age_min}분 전)"
 else
-    echo "✅ Hermes1 정상 (하트비트 ${age_min}분 전, PID=${pid:-없음})"
+    echo "✅ Hermes1 실행 중 (PID=$pid, 하트비트 파일 없음)"
 fi
