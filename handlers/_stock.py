@@ -690,8 +690,11 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # hermes_local.py 등록용 커맨드 맵
 # ════════════════════════════════════════════════════════════════
 from handlers._stock_mjstock import (
-    cmd_backtest, cmd_mjscan, cmd_mjstock,
+    cmd_mjstock,
     callback_mjstock, callback_mjstock_results,
+)
+from handlers._stock_mjstock_extra import (
+    cmd_backtest, cmd_mjscan,
     cmd_mjbuy, cmd_mjsell, cmd_mjpositions,
 )
 from handlers._stock_coin import cmd_coin, callback_coin
