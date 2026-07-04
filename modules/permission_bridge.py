@@ -41,12 +41,46 @@ EXTERNAL_TOOLS = {
 _approval_pending: dict = {}  # {chat_id: {"tool": str, "args": dict, "ts": float, "approved": Optional[bool]}}
 _APPROVAL_TIMEOUT = 120  # 초 단위 타임아웃
 
+# ── 증거 기반 권한 강등 (Managed Autonomy, arXiv 2607.00334 — 2026-07-03 추가) ──
+# 논문 핵심: 자율성 등급은 고정이 아니라 런타임 이상 신호에 따라 자동으로
+# 오르내려야 함. 기존 permission_bridge는 도구별 고정 2단계 분류만 있었음 —
+# 최근 거부 이력이 쌓인 도구는 INTERNAL이어도 일시적으로 강등, 쿨다운 지나면 자동 복귀.
+_RISK_STATE: dict = {}  # {tag_name: {"denial_count": int, "last_denial_ts": float}}
+RISK_DEMOTION_THRESHOLD = 2      # 이 횟수 이상 거부되면 강등
+RISK_COOLDOWN_SECONDS = 3600     # 마지막 거부 후 이 시간 지나면 카운트 리셋(자동 복귀)
+
+
+def _record_denial(tag_name: str) -> None:
+    """도구 거부 시 위험 카운트 누적."""
+    tag = tag_name.strip().upper()
+    now = time.time()
+    entry = _RISK_STATE.get(tag, {"denial_count": 0, "last_denial_ts": 0.0})
+    if now - entry["last_denial_ts"] > RISK_COOLDOWN_SECONDS:
+        entry["denial_count"] = 0
+    entry["denial_count"] += 1
+    entry["last_denial_ts"] = now
+    _RISK_STATE[tag] = entry
+
+
+def _is_demoted(tag_name: str) -> bool:
+    """최근 거부 이력이 임계치를 넘으면 True — INTERNAL이어도 강등 대상."""
+    tag = tag_name.strip().upper()
+    entry = _RISK_STATE.get(tag)
+    if not entry:
+        return False
+    if time.time() - entry["last_denial_ts"] > RISK_COOLDOWN_SECONDS:
+        return False  # 쿨다운 경과 — 자동 복귀
+    return entry["denial_count"] >= RISK_DEMOTION_THRESHOLD
+
 
 # ── Classification ────────────────────────────────────────────────────
 
 def classify_tool(tag_name: str) -> str:
-    """도구 태그를 Internal / External 로 분류"""
+    """도구 태그를 Internal / External 로 분류.
+    최근 거부 이력이 임계치를 넘은 도구는 INTERNAL이어도 EXTERNAL로 강등(증거 기반)."""
     tag = tag_name.strip().upper()
+    if _is_demoted(tag):
+        return "external"
     if tag in INTERNAL_TOOLS:
         return "internal"
     if tag in EXTERNAL_TOOLS:
@@ -173,6 +207,7 @@ async def handle_approval_callback(update, context) -> bool:
         )
     else:
         _approval_pending[chat_id]["approved"] = False
+        _record_denial(tool_name)
         await query.edit_message_text(
             f"❌ **PermissionBridge — 거부됨**\n\n도구 `{tool_name}` 실행이 거부되었습니다.",
             parse_mode="HTML",

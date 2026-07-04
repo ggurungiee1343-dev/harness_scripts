@@ -3,18 +3,18 @@ import sys
 import requests
 from dotenv import load_dotenv
 
-# ~/.hermes/.env 로딩
-env_path = "/Users/bluesea/.hermes/.env"
-load_dotenv(env_path)
+sys.path.insert(0, "/Users/bluesea/Applications/Mjauto/Scripts")
+import config  # noqa: E402 — ALLOWED_ID (Mjauto/.env)
 
-bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-allowed_users = os.getenv("TELEGRAM_ALLOWED_USERS")
+# hermes_local.py(라이브 봇)와 동일한 우선순위: HERMES1_BOT_TOKEN 우선,
+# ~/.hermes/.env 기준. config.TELEGRAM_TOKEN(HARNESS_BOT_TOKEN)은 이 봇과 무관 — 2026-07-02 확인
+load_dotenv("/Users/bluesea/.hermes/.env")
+bot_token = os.getenv("HERMES1_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+chat_id = config.ALLOWED_ID
 
-if not bot_token or not allowed_users:
-    print("Error: TOKEN or ALLOWED_USERS not found in .env")
+if not bot_token or not chat_id:
+    print("Error: HERMES1_BOT_TOKEN(~/.hermes/.env) or ALLOWED_USER_ID(Mjauto/.env) not found")
     sys.exit(1)
-
-chat_id = allowed_users.split(",")[0].strip()
 
 # 인자 처리 (전송할 텍스트 입력받음)
 if len(sys.argv) < 2:

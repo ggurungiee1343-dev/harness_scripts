@@ -11,7 +11,7 @@ harness_agent.py handle_message() L347~443에서 분리 (2026-06-09).
   - 예외 처리 + 진행 메시지 정리
 
 에러 진단:
-  - ImportError: modules.context_assembler → context_assembler.py 존재 확인
+  - ImportError: modules.context_assembler_v2 → context_assembler_v2.py 존재 확인
   - ImportError: modules.agentic_loop → agentic_loop.py 존재 확인
   - ImportError: modules.permission_bridge → permission_bridge.py 존재 확인
   - ChatAction 에러 → telegram 패키지 버전 확인
@@ -39,7 +39,7 @@ async def handle_llm_response(
     get_sys_prompt,
 ) -> None:
     """LLM 호출 → 에이전틱 루프 → 응답 전송 전체 파이프라인."""
-    from modules.context_assembler import assemble_context
+    from modules.context_assembler_v2 import assemble_context
     from modules.agentic_loop import run_agentic_loop
 
     anim_task = None

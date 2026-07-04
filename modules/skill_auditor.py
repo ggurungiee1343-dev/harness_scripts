@@ -33,6 +33,10 @@ from datetime import datetime, timezone
 logger = logging.getLogger("HermesOrchestrator")
 
 SKILLS_DIR    = Path("/Users/bluesea/.hermes/skills")
+# 2026-07-02: ~/.claude/skills/ 누락 발견 (arXiv 2607.01136 "Skills Are Not Islands" 검토 중) —
+# book-to-skill 등 Claude Code 전용 스킬은 이 경로에 설치되는데 감사 대상에서 빠져 있었음
+CLAUDE_SKILLS_DIR = Path("/Users/bluesea/.claude/skills")
+SKILLS_DIRS   = [SKILLS_DIR, CLAUDE_SKILLS_DIR]
 AUDIT_LOG     = Path("/Users/bluesea/.hermes/runtime/skill_audit.log")
 LIFECYCLE_DB  = Path("/Users/bluesea/.hermes/runtime/skill_lifecycle.json")
 
@@ -52,7 +56,14 @@ _RISK_PATTERNS: List[Tuple[str, str, int]] = [
     (r"__import__|importlib\.import",            "동적 모듈 로드",         2),
     (r"pickle\.loads|marshal\.loads",            "역직렬화 (RCE 위험)",    3),
     (r"base64\.b64decode.*exec|eval.*decode",    "인코딩 우회 실행",       3),
-    (r"ANTHROPIC_API_KEY|OPENAI_API_KEY|TOKEN",  "API 키 하드코딩 의심",   3),
+    # 2026-07-02: 기존 `TOKEN` 단독 키워드 매칭은 "token budget" 같은 설명문에도 걸려
+    # 46개 스킬 중 17개 오탐(SUSPICIOUS) 발생 → 실제 대입(하드코딩) 또는 알려진 키 형식
+    # 리터럴만 잡도록 정밀화 (task_2e4b596d)
+    (r"(?:api[_-]?key|token|secret)\s*=\s*[\"'][A-Za-z0-9_\-]{20,}[\"']",
+     "API 키/토큰 하드코딩 의심 (변수 대입)", 3),
+    (r"[\"'](?:sk-ant-|sk-proj-|sk-|ghp_|gho_|xox[baprs]-|AIza)[A-Za-z0-9_\-]{10,}[\"']",
+     "알려진 API 키 형식 리터럴 발견", 3),
+    (r"skills[/\\][^\"'\n]*SKILL\.md",           "스킬을 생성하는 스킬(공급망 리스크)", 2),
 ]
 
 _SEVERITY_LABEL = {1: "🟢 LOW", 2: "🟡 MEDIUM", 3: "🔴 HIGH"}
@@ -60,14 +71,15 @@ _SEVERITY_LABEL = {1: "🟢 LOW", 2: "🟡 MEDIUM", 3: "🔴 HIGH"}
 
 class SkillAuditor:
     """
-    ~/.hermes/skills/ 전체 스킬 동적 감사 엔진.
+    스킬 디렉토리(들) 전체 동적 감사 엔진.
+    기본값은 ~/.hermes/skills/ + ~/.claude/skills/ 둘 다 (2026-07-02부터).
     """
 
-    def __init__(self, skills_dir: Path = SKILLS_DIR):
-        self.skills_dir = skills_dir
+    def __init__(self, skills_dirs: List[Path] = None):
+        self.skills_dirs = skills_dirs if skills_dirs is not None else list(SKILLS_DIRS)
         self.results: List[Dict] = []
 
-    def _scan_file(self, file_path: Path) -> List[Dict]:
+    def _scan_file(self, file_path: Path, skill_dir: Path) -> List[Dict]:
         """단일 파일 정적+패턴 스캔."""
         findings = []
         try:
@@ -79,7 +91,7 @@ class SkillAuditor:
             matches = re.findall(pattern, content, re.IGNORECASE)
             if matches:
                 findings.append({
-                    "file": str(file_path.relative_to(self.skills_dir)),
+                    "file": str(file_path.relative_to(skill_dir.parent)),
                     "pattern": pattern,
                     "description": description,
                     "severity": severity,
@@ -89,16 +101,24 @@ class SkillAuditor:
                 })
         return findings
 
+    def _find_skill_dir(self, skill_name: str) -> Path:
+        """스킬 이름으로 실제 루트(여러 스킬 디렉토리 중) 탐색."""
+        for root in self.skills_dirs:
+            candidate = root / skill_name
+            if candidate.exists():
+                return candidate
+        return None
+
     def audit_skill(self, skill_name: str) -> Dict:
-        """단일 스킬 감사. SKILL.md + 추가 .py/.sh 파일 포함."""
-        skill_dir = self.skills_dir / skill_name
-        if not skill_dir.exists():
+        """단일 스킬 감사. SKILL.md + 추가 .py/.sh 파일 포함. 여러 스킬 루트 중 어디 있든 탐색."""
+        skill_dir = self._find_skill_dir(skill_name)
+        if skill_dir is None:
             return {"skill": skill_name, "status": "NOT_FOUND", "findings": []}
 
         all_findings = []
         for ext in ["*.md", "*.py", "*.sh"]:
-            for f in skill_dir.glob(ext):
-                all_findings.extend(self._scan_file(f))
+            for f in skill_dir.rglob(ext):
+                all_findings.extend(self._scan_file(f, skill_dir))
 
         high_count = sum(1 for f in all_findings if f["severity"] == 3)
         med_count  = sum(1 for f in all_findings if f["severity"] == 2)
@@ -113,24 +133,26 @@ class SkillAuditor:
         return {
             "skill": skill_name,
             "status": status,
+            "root": str(skill_dir.parent),
             "high": high_count,
             "medium": med_count,
             "findings": all_findings,
         }
 
     def audit_all(self, write_log: bool = True) -> str:
-        """모든 스킬 감사 후 요약 보고서 반환."""
-        if not self.skills_dir.exists():
-            return "⚠️ 스킬 디렉토리 없음"
+        """모든 스킬 루트(디렉토리들) 감사 후 요약 보고서 반환."""
+        skills: List[str] = []
+        for root in self.skills_dirs:
+            if root.exists():
+                skills.extend(d.name for d in root.iterdir() if d.is_dir())
 
-        skills = [d.name for d in self.skills_dir.iterdir() if d.is_dir()]
         if not skills:
-            return "스킬 없음"
+            return "⚠️ 스킬 디렉토리 없음 또는 스킬 없음"
 
         self.results = []
         suspicious, review, clean = [], [], []
 
-        for skill_name in sorted(skills):
+        for skill_name in sorted(set(skills)):
             result = self.audit_skill(skill_name)
             self.results.append(result)
             if "SUSPICIOUS" in result["status"]:
@@ -143,7 +165,7 @@ class SkillAuditor:
         lines = [
             f"🔍 <b>Runtime Skill Audit</b>",
             f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC",
-            f"총 {len(skills)}개 스킬 감사\n",
+            f"총 {len(skills)}개 스킬 감사 ({', '.join(str(r) for r in self.skills_dirs)})\n",
             f"⛔ 의심 ({len(suspicious)}개): {', '.join(suspicious) or '없음'}",
             f"⚠️  검토 ({len(review)}개): {', '.join(review) or '없음'}",
             f"✅ 정상 ({len(clean)}개): {len(clean)}개",
@@ -273,6 +295,25 @@ class SkillLifecycle:
             (call_count >= 10 and success_rate < STALE_SUCCESS_FLOOR)
         )
         entry["days_since_use"] = days_since
+
+    def mark_generated_by(self, skill_name: str, generator: str):
+        """스킬 공급망 provenance 기록 — '이 스킬을 누가/무엇이 만들었나' 한 줄.
+
+        2026-07-02: arXiv 2607.01136 "Skills Are Not Islands" 검토 후 추가.
+        무거운 의존성 그래프 대신, 생성된 스킬에 생성자 문자열 하나만 남기는
+        경량 provenance. 자동 감지 아님 — 스킬 생성 직후 수동/스크립트 호출 필요.
+        """
+        if skill_name not in self._data:
+            self._data[skill_name] = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "last_used": datetime.now(timezone.utc).isoformat(),
+                "call_count": 0,
+                "success_count": 0,
+                "is_stale": False,
+            }
+        self._data[skill_name]["generated_by"] = generator
+        self._save()
+        logger.info(f"[SkillLifecycle] provenance: {skill_name} generated_by={generator}")
 
     def get_stale_skills(self) -> List[str]:
         """stale 스킬 목록 반환."""

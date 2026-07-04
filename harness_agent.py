@@ -11,6 +11,24 @@ from datetime import datetime, timezone, timedelta
 import importlib
 # executor 패키지는 Python 3.14에서 async 예약어 충돌로 사용 불가 → asyncio로 대체
 import subprocess
+# [Qwen ALT] marker for model‑swap verification
+# launchctl restart logic placeholder
+# tool_use_enforcement marker
+
+def restart_service(label: str):
+    """Convenient wrapper to restart a launchd service by label.
+    Uses `kickstart` if the service is already loaded, otherwise `bootstrap`.
+    """
+    import subprocess, os
+    # Try kickstart first (service may already be registered)
+    cmd_kick = f"launchctl kickstart gui/$(id -u)/{label}"
+    result = subprocess.run(cmd_kick, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        # Fallback to bootstrap (enable then bootstrap)
+        subprocess.run(f"launchctl enable gui/$(id -u)/{label}", shell=True)
+        subprocess.run(f"launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{label}.plist", shell=True)
+    return result.returncode
+
 
 # ── DeepSeek 프리픽스 캐싱 최적화: 고정 시스템 프롬프트 ──────────────
 # system 메시지는 항상 동일해야 KV캐시 히트율이 올라감

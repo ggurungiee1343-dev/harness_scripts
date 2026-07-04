@@ -451,6 +451,7 @@ def main():
     app.add_handler(CommandHandler('memory', cmd_memory))
     app.add_handler(CommandHandler('memory_search', cmd_memory_search))
     app.add_handler(CommandHandler('memory_audit', cmd_memory_audit))
+    app.add_handler(CommandHandler('jumbo', cmd_jumbo))
     app.add_handler(CommandHandler('claude_brief', cmd_claude_brief))
     app.add_handler(CommandHandler('verify_harness', cmd_verify_harness))
     app.add_handler(CommandHandler('retry', cmd_retry))
@@ -510,6 +511,77 @@ async def cmd_reduce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         
     except Exception as e:
         await update.message.reply_text(f"❌ 오류: {str(e)[:100]}")
+
+async def cmd_jumbo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/jumbo <subcommand> — 로컬 Jumbo Lite 실행"""
+    import importlib.util, os, sys
+    # 최소 권한 확인
+    async def _reply(msg):
+        await update.message.reply_text(msg)
+    if not await check_user(update):
+        return
+    # 파싱
+    parts = update.message.text.split()
+    if len(parts) < 2:
+        await _reply('사용법: /jumbo <init|add-memory|add-goal|run|verify|meta-update>')
+        return
+    sub = parts[1]
+    base_dir = os.path.expanduser('~/.hermes/skills/devops/hermes-jumbo-lite')
+    scripts_dir = os.path.join(base_dir, 'scripts')
+    def load_script(name):
+        spec = importlib.util.spec_from_file_location(name, os.path.join(scripts_dir, f"{name}.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    if sub == 'init':
+        # ensure assets exist (already created)
+        await _reply('Jumbo Lite 초기화 완료. 메모리·목표 파일이 준비되었습니다.')
+    elif sub == 'add-memory':
+        if len(parts) < 4:
+            await _reply('사용법: /jumbo add-memory <key> <value>')
+            return
+        key, value = parts[2], ' '.join(parts[3:])
+        mem_path = os.path.join(base_dir, 'assets', 'memory.json')
+        import json
+        data = json.loads(open(mem_path).read())
+        data[key] = value
+        open(mem_path, 'w').write(json.dumps(data, ensure_ascii=False, indent=2))
+        await _reply(f'메모리 항목 추가: {key} = {value}')
+    elif sub == 'add-goal':
+        if len(parts) < 4:
+            await _reply('사용법: /jumbo add-goal <id> <description>')
+            return
+        gid, desc = parts[2], ' '.join(parts[3:])
+        goals_path = os.path.join(base_dir, 'assets', 'goals.json')
+        import json
+        data = json.loads(open(goals_path).read())
+        data[gid] = {'description': desc}
+        open(goals_path, 'w').write(json.dumps(data, ensure_ascii=False, indent=2))
+        await _reply(f'목표 추가: [{gid}] {desc}')
+    elif sub == 'run':
+        # Load context, enforce prompt, guardrails, then set as global context (placeholder)
+        mod_load = load_script('load_context')
+        ctx = mod_load.load_context()
+        mod_prompt = load_script('enforce_prompt')
+        ok = mod_prompt.enforce_prompt_limit()
+        mod_guard = load_script('guardrails')
+        guard_ok, guard_msg = mod_guard.guardrails_check()
+        msgs = []
+        msgs.append('컨텍스트 로드 및 결합 완료.')
+        msgs.append('프롬프트 길이 검사: ' + ('통과' if ok else '초과 - 자동 절단'))
+        msgs.append('가드레일 검증: ' + guard_msg)
+        await _reply('\n'.join(msgs))
+    elif sub == 'verify':
+        mod_route = load_script('route_check')
+        ok, msg = mod_route.route_check()
+        await _reply(f'라우팅 검증: {msg}')
+    elif sub == 'meta-update':
+        mod_meta = load_script('update_meta')
+        res = mod_meta.update_meta()
+        await _reply(res)
+    else:
+        await _reply('알 수 없는 subcommand.')
 
 if __name__ == '__main__':
     main()

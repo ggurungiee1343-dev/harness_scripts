@@ -82,6 +82,16 @@ async def handle_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text(f'❌ 분석 오류: {e}')
         return
 
+    # === MJcoin 코인 콜백 (coin_all: / coin_chart:) ===
+    if data.startswith('coin_all:') or data.startswith('coin_chart:'):
+        try:
+            from handlers._stock import callback_coin
+            await callback_coin(update, context)
+        except Exception as e:
+            logger.error(f'coin 콜백 오류: {e}')
+            await query.edit_message_text(f'❌ 코인 분석 오류: {e}')
+        return
+
     # === Harness 콜백 위임 ===
     if data.startswith('harness_'):
         try:

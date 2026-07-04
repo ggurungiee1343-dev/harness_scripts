@@ -21,10 +21,10 @@
     <integer>3</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/bluesea/Applications/Mjauto/Scripts/fswatch-indexer.log</string>
+    <string>/Users/bluesea/Applications/Mjauto/Scripts/logs/fswatch-indexer.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/bluesea/Applications/Mjauto/Scripts/fswatch-indexer.log</string>
+    <string>/Users/bluesea/Applications/Mjauto/Scripts/logs/fswatch-indexer.log</string>
 
     <key>WorkingDirectory</key>
     <string>/Users/bluesea/Applications/Mjauto/Scripts</string>

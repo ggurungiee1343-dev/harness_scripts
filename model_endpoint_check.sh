@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================
-# 모델 엔드포인트 생존 확인 스크립트 (v1.0 — 2026-06-07)
+# 모델 엔드포인트 생존 확인 스크립트 (v1.1 — 2026-07-02)
 # 사용법: bash model_endpoint_check.sh
 #
 # 목적: NVIDIA NIM 70B 조용한 서비스 종료 사건(장애#024) 재발 방지.
@@ -10,6 +10,7 @@
 #   - NVIDIA GPT OSS 120B  (openai/gpt-oss-120b)
 #   - DeepSeek Chat        (deepseek-chat)
 #   - Qwen 로컬 llama-server (port 8080)
+#   - 활성 모델(llm_mode.txt) 표준 워크플로우 회귀 스모크 테스트 (v1.1)
 # ==============================================================
 
 GREEN='\033[0;32m'
@@ -110,6 +111,70 @@ else
   echo "         재기동: launchctl kickstart gui/$(id -u)/com.bluesea.llama_server2"
 fi
 
+# ----------------------------------------------------------
+# 4. 표준 워크플로우 회귀 스모크 테스트
+#    (엔드포인트 생존 ≠ 하네스 워크플로우 정상 — 모델 교체 후
+#     실제 응답 구조까지 확인. 모델 중립성 원칙, CLAUDE.md 섹션 6 참조)
+# ----------------------------------------------------------
+echo ""
+echo "▶ 회귀 스모크 테스트 — 활성 모델(llm_mode.txt) 표준 태스크 응답"
+
+LLM_MODE_FILE="$HOME/.hermes/llm_mode.txt"
+ACTIVE_MODE=$(cat "$LLM_MODE_FILE" 2>/dev/null || echo "GPT OSS 120B")
+echo "  현재 텔레그램 LLM 모드: ${ACTIVE_MODE}"
+
+SMOKE_PROMPT='다음 문장에서 의도를 한 단어로 답하라: 봇 재시작해줘 — 다른 말 없이 단어 하나만 출력.'
+
+case "$ACTIVE_MODE" in
+  "DeepSeek")
+    SMOKE_KEY="$DEEPSEEK_KEY"
+    SMOKE_URL="https://api.deepseek.com/v1/chat/completions"
+    SMOKE_MODEL="deepseek-chat"
+    ;;
+  "Qwen-14B")
+    SMOKE_URL="http://127.0.0.1:8080/v1/chat/completions"
+    SMOKE_MODEL="${MODEL_ID:-local}"
+    SMOKE_KEY=""
+    ;;
+  *)
+    SMOKE_KEY="$NVIDIA_KEY"
+    SMOKE_URL="https://integrate.api.nvidia.com/v1/chat/completions"
+    SMOKE_MODEL="openai/gpt-oss-120b"
+    ;;
+esac
+
+if [ -z "$SMOKE_KEY" ] && [ "$SMOKE_URL" != "http://127.0.0.1:8080/v1/chat/completions" ]; then
+  warn "활성 모델(${ACTIVE_MODE}) API 키 없음 — 회귀 테스트 건너뜀"
+else
+  AUTH_HEADER=()
+  [ -n "$SMOKE_KEY" ] && AUTH_HEADER=(-H "Authorization: Bearer $SMOKE_KEY")
+
+  SMOKE_RESP=$(curl -s --max-time 30 \
+    -X POST "$SMOKE_URL" \
+    -H "Content-Type: application/json" \
+    "${AUTH_HEADER[@]}" \
+    -d "{\"model\":\"$SMOKE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"$SMOKE_PROMPT\"}],\"max_tokens\":2048}" 2>/dev/null)
+
+  SMOKE_TEXT=$(echo "$SMOKE_RESP" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    msg = d['choices'][0]['message']
+    text = msg.get('content') or msg.get('reasoning_content') or ''
+    print(text.strip()[:50])
+except Exception:
+    print('')
+" 2>/dev/null)
+
+  if [ -n "$SMOKE_TEXT" ]; then
+    ok "회귀 테스트 응답 수신 (${ACTIVE_MODE}/${SMOKE_MODEL}): \"$SMOKE_TEXT\""
+  else
+    fail "회귀 테스트 — 활성 모델(${ACTIVE_MODE}/${SMOKE_MODEL})이 응답 구조를 만족 못 함"
+    echo "         → 모델 교체 직후라면 harness_agent.py/llm_engines.py의 파싱 로직(content/reasoning_content)이"
+    echo "           신규 모델 응답 형식과 맞는지 확인 필요"
+  fi
+fi
+
 echo ""
 echo "=============================================="
 echo " 완료"
@@ -117,4 +182,6 @@ echo " DEAD 항목 발생 시:"
 echo "   NVIDIA 모델 교체 → harness_agent.py model= 값 수정"
 echo "   DeepSeek 장애   → switch_model.sh got 으로 전환"
 echo "   llama-server 다운 → launchctl kickstart 로 재기동"
+echo " 회귀 테스트 실패 시:"
+echo "   llm_engines.py 응답 파싱 로직과 신규 모델 출력 형식 불일치 가능성 우선 확인"
 echo "=============================================="

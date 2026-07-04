@@ -4,6 +4,22 @@ from telegram.ext import ContextTypes
 from modules.weakness_miner import get_weakness_miner
 from handlers._base import router, logger, add_to_history, _call_llm, safe_reply, safe_edit
 
+_RESEARCH_HELP = (
+    "🔬 **/research 명령어** — Knowledge Mesh (PKM_2)\n\n"
+    "• `/research [질문]` — 전체 연구 파이프라인 실행\n"
+    "   (로컬 검색 + 타임라인 + 주제 클러스터링 + LLM 분석)\n"
+    "• `/research local [질문]` — 로컬 위키 검색만\n"
+    "• `/research tl [주제]` — 타임라인만\n"
+    "• `/research xref [주제]` — 교차 참조 클러스터링만\n\n"
+    "📂 **주제 관리**\n"
+    "• `/research topics` — 전체 주제 목록\n"
+    "• `/research classify [문서경로]` — 문서 주제 분류\n"
+    "• `/research classifyall` — 전체 문서 배치 분류\n"
+    "• `/research recluster` — 주제 클러스터 재구성\n\n"
+    "📊 **상태**\n"
+    "• `/research stats` — 시스템 통계"
+)
+
 async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /research — PKM_2 Knowledge Mesh 연구 명령어

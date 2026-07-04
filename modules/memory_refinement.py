@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
+from modules.deriver_layer import ForgettingCurve
+
 logger = logging.getLogger("HermesOrchestrator")
 
 # ── 경로 상수 ────────────────────────────────────────────────────
@@ -241,8 +243,6 @@ def auto_forget(dry_run: bool = True) -> Dict:
     Returns:
         {"candidates": [...], "removed": int, "remaining": int}
     """
-    import math
-
     l2 = _load_json(_L2_PATH)
     episodes = l2.get("episodes", [])
     associations = l2.get("associations", {})
@@ -255,14 +255,13 @@ def auto_forget(dry_run: bool = True) -> Dict:
         importance = ep.get("importance", 1.0)
         last_accessed = ep.get("last_accessed", ep.get("timestamp", ""))
 
-        # 보유율 계산 (에빙하우스)
+        # 보유율 계산 (에빙하우스) — deriver_layer.ForgettingCurve 재사용 (2026-07-03: 중복 구현 제거)
+        retention = ForgettingCurve.retention(importance, last_accessed)
         try:
             last = datetime.fromisoformat(last_accessed)
         except Exception:
             last = now
         days_elapsed = (now - last).total_seconds() / 86400
-        stability = importance * 5.0
-        retention = round(math.exp(-days_elapsed / max(stability, 0.1)), 4)
 
         if retention < FORGET_RETENTION_THRESHOLD and days_elapsed >= FORGET_MIN_AGE_DAYS:
             candidates.append({
@@ -393,12 +392,21 @@ def should_store(text: str, role: str = "user") -> Tuple[bool, str]:
         return False, f"유사 에피소드 {similar_count}개 이미 존재 — 중복 저장 방지"
 
     # Sycophancy Filter (2606.10949): 아첨·오류 동의 패턴 차단
+    # 2026-07-02 개선: 원논문(MIST 벤치마크)의 실제 실패 유형은 "길고 그럴듯한 응답 안에서
+    # 사용자의 구체적 오류에 정정 없이 동의"하는 케이스 — 기존 80자 미만 제한은 짧은 아첨
+    # 문구만 잡고 이 케이스를 놓침(arXiv 2607.01871 조사 중 발견, 그 논문 자체는 실재하지
+    # 않았으나 원논문 재검증 과정에서 갭 확인). 길이 제한 제거, "정정/반박 신호 없이 동의만
+    # 있는가"로 판단 기준 전환.
     if role == "assistant":
         agreement_markers = ["맞아", "맞습니다", "맞네요", "정확해", "그렇네요",
                              "그렇죠", "맞죠", "당연히", "물론이죠", "당연하죠"]
+        correction_markers = ["다만", "하지만", "그런데", "정확히는", "사실은", "사실",
+                              "틀렸", "아니라", "아니에요", "예외", "주의할", "오류가",
+                              "실제로는", "정정"]
         matched = [m for m in agreement_markers if m in text]
-        if matched and len(text.strip()) < 80:
-            return False, f"아첨 패턴 감지 ({', '.join(matched)}) — 사용자 오류 동조 위험"
+        has_correction = any(m in text for m in correction_markers)
+        if matched and not has_correction:
+            return False, f"아첨 패턴 감지 ({', '.join(matched)}) — 정정/반박 신호 없이 동의만 함, 사용자 오류 동조 위험"
 
     return True, f"저장 권장 (중요도 {score:.1f}, 유사 {similar_count}개)"
 
@@ -512,8 +520,6 @@ def get_memory_health() -> str:
     메모리 건강 상태 요약 (forget 대상 수, L2 포화도 등).
     /memory 서브커맨드에서 활용.
     """
-    import math
-
     l2 = _load_json(_L2_PATH)
     episodes = l2.get("episodes", [])
     now = datetime.now(timezone.utc)
@@ -530,8 +536,8 @@ def get_memory_health() -> str:
         except Exception:
             last = now
         days = (now - last).total_seconds() / 86400
-        stability = importance * 5.0
-        retention = math.exp(-days / max(stability, 0.1))
+        # deriver_layer.ForgettingCurve 재사용 (2026-07-03: 중복 구현 제거)
+        retention = ForgettingCurve.retention(importance, last_accessed)
         total_retention += retention
 
         if retention < FORGET_RETENTION_THRESHOLD and days >= FORGET_MIN_AGE_DAYS:

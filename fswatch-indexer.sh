@@ -16,7 +16,7 @@ WATCH_DIRS=(
     "/Users/bluesea/Applications/Mjauto/Scripts/modules"
 )
 
-LOGFILE="/Users/bluesea/Applications/Mjauto/Scripts/fswatch-indexer.log"
+LOGFILE="/Users/bluesea/Applications/Mjauto/Scripts/logs/fswatch-indexer.log"
 
 {
     "$FSWATCH" -0 \
