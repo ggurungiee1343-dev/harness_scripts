@@ -130,16 +130,16 @@ async def _run_mjstock_universe_scan(update: Update, key: str):
                 loop.run_in_executor(pool, lambda: subprocess.run(
                     cmd, capture_output=True, text=True,
                     cwd=str(MJSTOCK_DIR / "screener"),
-                    timeout=2700,
+                    timeout=5400,  # 90분 — 500종목×다검색기 순차 스캔 완주 보장(데이터 축적 우선)
                 )),
-                timeout=2710,
+                timeout=5460,
             )
         if proc.returncode == 0:
             await safe_edit(msg, f"✅ {cfg['label']} 스캔 완료 — 검색기별 결과는 위쪽 메시지 참조")
         else:
             await safe_edit(msg, f"❌ {cfg['label']} 스캔 실패\n<code>{proc.stderr[-500:]}</code>", parse_mode="HTML")
     except (subprocess.TimeoutExpired, _aio.TimeoutError):
-        await safe_edit(msg, f"⏱ {cfg['label']} 타임아웃 (45분 초과)")
+        await safe_edit(msg, f"⏱ {cfg['label']} 타임아웃 (90분 초과)")
     except Exception as e:
         await safe_edit(msg, f"❌ 오류: {e}")
 
@@ -435,8 +435,15 @@ async def _handle_mjstock_scan_list(query, screener_key: str, date_str: str, bat
 
     lines.append("\n▼ 종목 클릭 → 차트 + 분석")
 
+    # Telegram reply_markup 크기 한도 회피 — 결과 많은 검색기(예 우량주농사 97종)를 전부 버튼화하면
+    # 'BadRequest: Reply markup is too long'으로 버튼 전체가 무반응. 점수 상위 N개만 버튼 노출.
+    _MAX_BTNS = 40
+    _df_btn = (df.sort_values("score", ascending=False) if "score" in df.columns else df).head(_MAX_BTNS).reset_index(drop=True)
+    if len(df) > _MAX_BTNS:
+        lines.append(f"<i>(종목 버튼은 점수 상위 {_MAX_BTNS}개만 — 전체 {len(df)}종)</i>")
+
     keyboard, row_btns = [], []
-    for i, row in df.iterrows():
+    for i, row in _df_btn.iterrows():
         rank = i + 1
         tkr  = str(row[id_col])
         score = int(row.get("score", 0))

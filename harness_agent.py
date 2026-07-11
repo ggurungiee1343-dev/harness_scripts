@@ -350,7 +350,8 @@ if __name__ == "__main__":
     async def auto_heal_loop():
         while True:
             try: sys_mon.auto_heal(os.path.join(config.SCRIPTS_DIR, "recovery_system.sh"))
-            except: pass  # noqa — SYCL500: harness_agent는 독립 실행 시 무시
+            except Exception as e:
+                print(f"⚠️ [harness auto_heal 실패] {e}")  # 원인은 남긴다
             await asyncio.sleep(60)
 
     async def main():

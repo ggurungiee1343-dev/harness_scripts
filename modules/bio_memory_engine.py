@@ -601,7 +601,8 @@ class BioMemoryEngine:
             try:
                 l1 = json.loads(self.l1_path.read_text(encoding="utf-8"))
                 history = [{"role": m["role"], "content": m["content"]} for m in l1[-max_history:]]
-            except: pass
+            except Exception as e:
+                logger.warning(f"[L1 대화 이력 로드 실패 — 손상 의심, 빈 컨텍스트로 진행] {e}")
         recalled = self.recall(current_query, top_k=3)
 
         # L3 pre-query 통합

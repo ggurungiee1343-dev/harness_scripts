@@ -57,8 +57,10 @@ sys.path.append('/Users/bluesea/Applications/Mjauto/Scripts/modules')
 # === 모듈 임포트 ===
 from hybrid_router import router
 from wiki_manager import WikiManager
-from verification_engine import verifier
 from cove_engine import cove_engine_instance  # ~/Applications/Mjauto/Scripts/cove_engine.py
+# verification_engine.py 통합 폐지(파일 실종) — verifier는 이제 CoVe 엔진과 동일 객체.
+# 호출부는 verifier.run_cove_pipeline(question) 사용.
+verifier = cove_engine_instance
 # executor 패키지가 Python 3.14에서 `async` 예약어 충돌(SyntaxError) → 직접 구현
 async def execute_bash_command(cmd: str, timeout: int = 30) -> dict:
     import asyncio

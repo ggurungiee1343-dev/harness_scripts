@@ -1,5 +1,5 @@
 """handlers._memory — 메모리/지식 명령어"""
-import uuid, datetime, shutil
+import uuid, datetime, shutil, asyncio
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -31,8 +31,8 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         history_data = []
 
     # CoVe 실행
-    verified_ans, pending_actions = await verifier.process_query(
-        question, history_data=history_data
+    verified_ans, pending_actions = await asyncio.to_thread(
+        verifier.run_cove_pipeline, question
     )
 
     await add_to_history('assistant', verified_ans)
@@ -101,10 +101,10 @@ async def cmd_cove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await add_to_history('user', f'[devil] {question}')
 
         try:
-            verified_ans, _ = await cove_engine_instance.process_query(
+            verified_ans, _ = await asyncio.to_thread(
+                cove_engine_instance.run_cove_pipeline,
                 f'다음 주장에 대한 반론(counterargument)을 생성하세요: "{question}"\n'
-                f'해당 주장의 취약점을 지적하고, 반대 증거나 논리를 제시하세요.',
-                mode='strict'
+                f'해당 주장의 취약점을 지적하고, 반대 증거나 논리를 제시하세요.'
             )
             header = f"⚔️ **Devil's Advocate — 반론 생성**\n📌 원 주장: `{question}`\n\n"
             reply = header + verified_ans
@@ -120,8 +120,8 @@ async def cmd_cove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await add_to_history('user', question)
 
     try:
-        verified_ans, _ = await cove_engine_instance.process_query(
-            question, mode='strict'
+        verified_ans, _ = await asyncio.to_thread(
+            cove_engine_instance.run_cove_pipeline, question
         )
     except Exception as e:
         logger.error(f'CoVe Error: {e}')
@@ -414,8 +414,8 @@ async def cmd_ask_logic(question: str) -> str:
     except Exception:
         history_data = []
 
-    verified_ans, _ = await verifier.process_query(
-        question, history_data=history_data
+    verified_ans, _ = await asyncio.to_thread(
+        verifier.run_cove_pipeline, question
     )
 
     # v9.x fallback: CoVe 빈 결과 시 LLM 직접 호출

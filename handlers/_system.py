@@ -407,7 +407,7 @@ async def cmd_secreview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"  - 권장 조치: ..."
         )
 
-        verified, _ = await cove_engine_instance.process_query(analysis_prompt, mode='balanced')
+        verified, _ = await asyncio.to_thread(cove_engine_instance.run_cove_pipeline, analysis_prompt)
         _audit_engine.log_audit("secreview", target_path, {"status": "completed"})
 
         reply = f"🔐 **보안 코드 리뷰 완료**\n📂 대상: `{target_path}`\n\n{verified}"

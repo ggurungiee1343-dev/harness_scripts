@@ -1,1 +1,50 @@
-[{"role": "user", "content": "/ㅗ디ㅔ"}, {"role": "assistant", "content": "주요 프로젝트 폴더들이 보입니다. `hermes_local.py`가 가장 중요한 스크립트일 가능성이 높습니다. 각 폴더를 확인하겠습니다.\n\n[LIST: /Users/bluesea/Applications/Mjobsidian/]\n[LIST: /Users/bluesea/Applications/Mjauto/]\n[LIST: /Users/bluesea/Applications/Mjstock/]"}, {"role": "user", "content": "하이"}, {"role": "assistant", "content": "안녕하세요, MJ 박사님! 무엇을 도와드릴까요?"}, {"role": "user", "content": "하이"}, {"role": "assistant", "content": "안녕하세요, MJ 박사님! 무엇을 도와드릴까요?"}, {"role": "user", "content": "하이"}, {"role": "assistant", "content": "안녕하세요, MJ 박사님! 무엇을 도와드릴까요?"}, {"role": "user", "content": "하이"}, {"role": "assistant", "content": "안녕하세요, MJ 박사님! 무엇을 도와드릴까요?"}]
+[
+  {
+    "role": "assistant",
+    "content": "주요 프로젝트 폴더들이 보입니다. `hermes_local.py`가 가장 중요한 스크립트일 가능성이 높습니다. 각 폴더를 확인하겠습니다.\n\n[LIST: /Users/bluesea/Applications/Mjobsidian/]\n[LIST: /Users/bluesea/Applications/Mjauto/]\n[LIST: /Users/bluesea/Applications/Mjstock/]"
+  },
+  {
+    "role": "user",
+    "content": "하이"
+  },
+  {
+    "role": "assistant",
+    "content": "안녕하세요, MJ 박사님! 무엇을 도와드릴까요?"
+  },
+  {
+    "role": "user",
+    "content": "하이"
+  },
+  {
+    "role": "assistant",
+    "content": "안녕하세요, MJ 박사님! 무엇을 도와드릴까요?"
+  },
+  {
+    "role": "assistant",
+    "content": "[Vault Check] 4개 이슈, 319개 문서, 4.6MB | 중복: 525쌍 | 고립: 47/5634(0.8%)"
+  },
+  {
+    "role": "assistant",
+    "content": "[Vault Check] 4개 이슈, 319개 문서, 4.6MB | 중복: 525쌍 | 고립: 47/5634(0.8%)",
+    "timestamp": "2026-07-05T16:29:36.972445+00:00",
+    "importance": 0.5
+  },
+  {
+    "role": "assistant",
+    "content": "[Vault Check] 4개 이슈, 320개 문서, 4.6MB | 중복: 527쌍 | 고립: 47/5638(0.8%)"
+  },
+  {
+    "role": "assistant",
+    "content": "[Vault Graph] 5642노드 5322엣지, 47고립, 10허브"
+  },
+  {
+    "role": "assistant",
+    "content": "[Vault Check] 4개 이슈, 320개 문서, 4.6MB | 중복: 527쌍 | 고립: 47/5642(0.8%)"
+  },
+  {
+    "role": "assistant",
+    "content": "[Vault Check] 4개 이슈, 320개 문서, 4.6MB | 중복: 527쌍 | 고립: 47/5642(0.8%)",
+    "timestamp": "2026-07-06T16:11:11.119140+00:00",
+    "importance": 0.5
+  }
+]

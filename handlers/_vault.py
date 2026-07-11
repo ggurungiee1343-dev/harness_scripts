@@ -82,7 +82,9 @@ async def _vault_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             rel = os.path.relpath(full, BASE_DIR)
             try:
                 with open(full, 'r', encoding='utf-8', errors='ignore') as fh:
-                    first = fh.read(512)
+                    # 8192바이트: 프론트매터가 512바이트를 넘으면 닫는 '---'가 잘려
+                    # "닫히지 않음"으로 오탐되던 버그 수정(2026-07-07). 대부분 프론트매터는 8KB 이내.
+                    first = fh.read(8192)
             except Exception:
                 continue
             if first.startswith('---'):

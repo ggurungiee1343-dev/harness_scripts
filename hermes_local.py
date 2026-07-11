@@ -220,7 +220,8 @@ def _run_end_hook():
     if not os.path.exists(hook_path): return
     try:
         result = subprocess.run(['bash', hook_path], capture_output=True, text=True, timeout=30)
-    except Exception: pass
+    except Exception as e:
+        logger.warning(f"[end 훅 실행 실패] {e}")
 
 
 def _ensure_single_instance():
@@ -276,7 +277,8 @@ def main():
                 reply_markup=_make_keyboard(),
                 parse_mode='Markdown'
             )
-        except Exception: pass
+        except Exception as e:
+            logger.warning(f"[부팅 알림 발송 실패 — 텔레그램 도달 실패 의심] {e}")
 
         # v9.1 Cache Cleanup Scheduler
         async def _cache_cleanup_loop():
@@ -376,7 +378,8 @@ def main():
 
         TagLinker.subscribe("tag_approved", _v86_bridge_cascade_listener)
         logger.info("✅ [v8.6 아키텍처] DB 레이어와 지식 캐스케이드 간의 Pub-Sub 동적 버스 결합 성공.")
-    except Exception: pass
+    except Exception as e:
+        logger.error(f"⚠️ [v8.6 Pub-Sub Bus] 버스 결합 실패 — 지식 캐스케이드 미연결: {e}")
 
     try:
         from handlers._system import cmd_model as _cmd_model

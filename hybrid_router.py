@@ -83,7 +83,8 @@ class HybridRouter:
             print(f"💥 [v9.2 LB] 전 금융/외부 API 망 차단 -> 레거시 로컬 핸들러 최종 백업")
             if self.api_llm_func:
                 try: return await self.api_llm_func(messages)
-                except Exception: pass
+                except Exception as e2:
+                    print(f"💥 [v9.2 LB] API 백업 티어도 실패 -> 로컬 폴백: {e2}")
             return await self.local_llm_func(messages)
     # === HYBRID ROUTER PATCH END ===
 
@@ -142,7 +143,8 @@ class HybridRouter:
     async def _call_llm(self, prompt: str, provider: str = None) -> str:
         if provider is not None:
             try: return await self.llm_interface.complete(prompt, provider=provider.lower())
-            except Exception: pass
+            except Exception as e:
+                print(f"💥 [hybrid_router] 지정 provider '{provider}' 호출 실패 -> 자동 라우팅 폴백: {e}")
 
         messages = [{"role": "user", "content": prompt}]
         result = await self.route_and_execute(messages)
