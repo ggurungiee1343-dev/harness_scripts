@@ -141,15 +141,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _load_stock_handlers():
     from handlers._stock import (
-        cmd_stock, cmd_scan, cmd_market, cmd_watchlist, cmd_mjstock, cmd_coin,
+        cmd_stock, cmd_scan, cmd_market, cmd_watchlist, cmd_mjstock, cmd_coin, cmd_quant,
         callback_mjstock, callback_mjstock_results, callback_coin,
     )
-    return cmd_stock, cmd_scan, cmd_market, cmd_watchlist, cmd_mjstock, cmd_coin, callback_mjstock, callback_mjstock_results, callback_coin
+    return cmd_stock, cmd_scan, cmd_market, cmd_watchlist, cmd_mjstock, cmd_coin, cmd_quant, callback_mjstock, callback_mjstock_results, callback_coin
 
 
 def main():
     try:
-        cmd_stock, cmd_scan, cmd_market, cmd_watchlist, cmd_mjstock, cmd_coin, callback_mjstock, callback_mjstock_results, callback_coin = _load_stock_handlers()
+        cmd_stock, cmd_scan, cmd_market, cmd_watchlist, cmd_mjstock, cmd_coin, cmd_quant, callback_mjstock, callback_mjstock_results, callback_coin = _load_stock_handlers()
     except Exception as e:
         logger.error(f'주식 핸들러 로드 실패: {e}')
         sys.exit(1)
@@ -163,6 +163,7 @@ def main():
     app.add_handler(CommandHandler('watchlist', cmd_watchlist))
     app.add_handler(CommandHandler('mjstock',   cmd_mjstock))
     app.add_handler(CommandHandler('coin',      cmd_coin))
+    app.add_handler(CommandHandler('quant',     cmd_quant))
     # 인라인 버튼 콜백: 아침/장중 스캔 [결과 보기] 버튼 (더 구체적 패턴 — 반드시 mjstock[_:] 앞에)
     app.add_handler(CallbackQueryHandler(callback_mjstock_results, pattern=r'^mjstock_results__'))
     # 인라인 버튼 콜백: mjstock 분석 결과 버튼

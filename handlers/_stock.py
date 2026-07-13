@@ -494,6 +494,41 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(msg, f"❌ 오류: {e}")
 
 
+async def cmd_quant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/quant — MJstock 퀀트 월간 리포트 조회(재보정 이후 승률/기댓값 + 매수신호 궤적 분석).
+    이번 달 리포트가 이미 저장돼 있으면 즉시 보여주고, 없으면 그 자리에서 생성한다
+    (2026-07-13, MJ님 요청 — "보고싶다고 하면 알려주는 플랫폼". 크론 없이 요청 시점에만 생성/조회
+    하도록 설계 — screener/monthly_quant_report.py, docs/quant_validation_evolution_2026-07.html 참조)."""
+    import datetime
+    import os
+
+    msg = await safe_reply(update.message, "📊 퀀트 리포트 조회 중...")
+    try:
+        report_dir = "/Users/bluesea/Applications/Mjstock/results/quant_reports"
+        screener_dir = "/Users/bluesea/Applications/Mjstock/screener"
+        now = datetime.datetime.now()
+        report_path = os.path.join(report_dir, f"{now.strftime('%Y-%m')}.txt")
+
+        force_new = context.args and context.args[0] in ("new", "생성")
+        if force_new or not os.path.exists(report_path):
+            await safe_edit(msg, "📊 리포트가 없어 지금 생성합니다(1~2분 소요, 잠시만요)...")
+            proc = subprocess.run(
+                ["/Users/bluesea/Applications/Mjstock/.venv/bin/python", "monthly_quant_report.py"],
+                cwd=screener_dir, timeout=600, capture_output=True, text=True,
+            )
+            if proc.returncode != 0:
+                await safe_edit(msg, f"❌ 리포트 생성 실패:\n{proc.stderr[-1500:]}")
+                return
+
+        with open(report_path, encoding="utf-8") as f:
+            text = f.read()
+        tail = text[-3500:]  # 텔레그램 4096자 제한 대응 — 최신 항목만
+        await safe_edit(msg, f"```\n{tail}\n```", parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        await safe_edit(msg, f"❌ 오류: {e}")
+
+
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/watchlist [add/rm/list/scan] [TICKER]"""
     args = context.args or []
