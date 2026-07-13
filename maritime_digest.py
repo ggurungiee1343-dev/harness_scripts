@@ -53,28 +53,58 @@ PAPER_QUERIES = [
 MAX_PER_QUERY = 2
 TOTAL_TARGET = 12
 
-SUMMARY_SYS_PROMPT = """당신은 해사법(maritime law) 전공 법학박사 수료생이자 현직 도선사(harbor pilot)인
+COMMON_INTRO = """당신은 해사법(maritime law) 전공 법학박사 수료생이자 현직 도선사(harbor pilot)인
 전문가에게 브리핑하는 리서치 어시스턴트입니다. 목적은 두 가지입니다: ①박사논문/학회 소논문 아이디어,
-②해양·도선(pilotage)·선박조종 분야 특허 아이디어. 아래 검색 결과 하나가 해사법·해상안전·도선·
-선박조종·선박안전규제·IMO·해양 자율운항 기술 등과 실질적으로 관련이 있는지 먼저 판단하십시오
-(단순히 "선박"이라는 단어가 들어간 관광/커뮤니티/무관 페이지는 관련 없음으로 처리).
+②해양·도선(pilotage)·선박조종 분야 특허 아이디어.
 
 **국적·언어는 전혀 신경 쓰지 마십시오** — 한국 자료든 해외(영어 등) 자료든 관련성만으로 동일하게
-평가하십시오. 오히려 해외 최신 연구·기술·판례가 국내에 없는 새로운 논문·특허 아이디어의 원천일 수 있습니다.
+평가하십시오. 오히려 해외 최신 연구·기술·판례가 국내에 없는 새로운 논문·특허 아이디어의 원천일 수 있습니다."""
+
+# 2026-07-14: MJ님 지적 — "뉴스보낸거봤는데 뉴스가아니고 날씨, 법소개 이런게섞여있네."
+# 주제 관련성만 보고 채택하다 보니 법령 원문·기관 홈페이지 소개·날씨예보 도구 페이지 같은
+# "참고자료"가 [뉴스] 칸에 섞여 들어간 문제. 뉴스와 논문의 판정 기준을 분리해서, 뉴스 카테고리는
+# "실제 보도 기사인가"까지 별도로 요구하도록 함.
+NEWS_SYS_PROMPT = COMMON_INTRO + """
+
+아래 검색 결과가 **① 해사법·해상안전·도선·선박조종·선박안전규제·IMO·해양 자율운항 기술 등과
+실질적으로 관련 있고, 동시에 ② 실제 뉴스 기사(최근 사건·발표·사고·판결·정책변경 등을 보도하는 글)인지**
+판단하십시오. 아래는 주제가 관련 있어 보여도 뉴스가 아니므로 **반드시 관련도 0~2점**으로 처리하십시오:
+- 법령/조문 원문 자체(예: 국가법령정보센터의 법 조문 페이지)
+- 기관·학회 홈페이지 소개/연혁 페이지
+- 날씨·기상 예보 도구 페이지
+- 백과사전(위키피디아 등) 개요 항목
+- 선박 실시간 추적 서비스(MarineTraffic 등) 홈페이지 자체(단, 그 서비스를 다룬 보도기사라면 뉴스로 인정)
+
+단순히 "선박"이라는 단어가 들어간 관광/커뮤니티/무관 페이지도 관련 없음으로 처리하십시오.
 
 반드시 아래 형식으로만 답하십시오:
 RELEVANCE: <0~10 정수>
-SUMMARY: <관련 있으면 한국어 2~3문장 요약 + (법학 연구 또는 특허) 활용 방안 한 줄. 관련 없으면 "관련 없음"만 기재>
+SUMMARY: <뉴스로 인정되면 한국어 2~3문장 요약 + (법학 연구 또는 특허) 활용 방안 한 줄. 아니면 "관련 없음"만 기재>
+
+과장하지 말고, 실제로 자료 내용에 근거해서만 작성하십시오."""
+
+PAPER_SYS_PROMPT = COMMON_INTRO + """
+
+아래 검색 결과가 논문·학술 리뷰·연구보고서·법령해설서 등 **학술/연구 자료**로서 해사법·해상안전·도선·
+선박조종·선박안전규제·IMO·해양 자율운항 기술과 실질적으로 관련 있는지 판단하십시오(뉴스 기사 여부는
+따지지 않습니다 — 오히려 논문·리포트·기술 리뷰가 이 카테고리의 정석입니다). 다만 아래는 학술자료가
+아니므로 낮은 점수로 처리하십시오: 백과사전 개요 항목, 기관 홈페이지 소개 페이지, 단순 뉴스 기사.
+
+반드시 아래 형식으로만 답하십시오:
+RELEVANCE: <0~10 정수>
+SUMMARY: <학술자료로 인정되면 한국어 2~3문장 요약 + (법학 연구 또는 특허) 활용 방안 한 줄. 아니면 "관련 없음"만 기재>
 
 과장하지 말고, 실제로 자료 내용에 근거해서만 작성하십시오."""
 
 RELEVANCE_THRESHOLD = 6
 
 
-async def _evaluate(title: str, body: str, url: str) -> tuple[int, str]:
-    """관련도 점수 + 요약을 함께 반환. (관련도, 요약문) — 관련도 낮으면 요약은 무시할 것."""
+async def _evaluate(title: str, body: str, url: str, content_type: str = "news") -> tuple[int, str]:
+    """관련도 점수 + 요약을 함께 반환. (관련도, 요약문) — 관련도 낮으면 요약은 무시할 것.
+    content_type: "news"면 실제 보도기사인지까지 요구, "paper"면 학술자료 기준으로 판정."""
+    sys_prompt = NEWS_SYS_PROMPT if content_type == "news" else PAPER_SYS_PROMPT
     messages = [
-        {"role": "system", "content": SUMMARY_SYS_PROMPT},
+        {"role": "system", "content": sys_prompt},
         {"role": "user", "content": f"제목: {title}\n본문 발췌: {body[:800]}\n출처: {url}"},
     ]
     try:
@@ -95,7 +125,8 @@ async def _evaluate(title: str, body: str, url: str) -> tuple[int, str]:
         return 0, f"(요약 실패: {e})"
 
 
-async def _find_relevant(query: str, want: int, seen_urls: set, pool_size: int = 5) -> list[tuple[dict, str]]:
+async def _find_relevant(query: str, want: int, seen_urls: set, pool_size: int = 5,
+                          content_type: str = "news") -> list[tuple[dict, str]]:
     """검색 결과 pool 중 관련도 임계값을 넘는 상위 want개를 (raw_result, summary)로 반환.
     seen_urls에 있는 링크는 건너뛰고, 채택된 링크는 seen_urls에 즉시 추가(중복 방지)."""
     results = _search(query, max_results=pool_size)
@@ -104,7 +135,7 @@ async def _find_relevant(query: str, want: int, seen_urls: set, pool_size: int =
         title, body, href = r.get("title", ""), r.get("body", ""), r.get("href", "")
         if not href or href in seen_urls:
             continue
-        score, summary = await _evaluate(title, body, href)
+        score, summary = await _evaluate(title, body, href, content_type=content_type)
         if score >= RELEVANCE_THRESHOLD:
             accepted.append((r, summary))
             seen_urls.add(href)
@@ -134,13 +165,15 @@ async def build_digest() -> str:
     for q in NEWS_QUERIES:
         if len(news_items) + len(paper_items) >= TOTAL_TARGET:
             break
-        found = await _find_relevant(q, want=MAX_PER_QUERY, seen_urls=seen_urls, pool_size=6)
+        found = await _find_relevant(q, want=MAX_PER_QUERY, seen_urls=seen_urls, pool_size=6,
+                                      content_type="news")
         news_items.extend(found)
 
     for q in PAPER_QUERIES:
         if len(news_items) + len(paper_items) >= TOTAL_TARGET:
             break
-        found = await _find_relevant(q, want=MAX_PER_QUERY, seen_urls=seen_urls, pool_size=6)
+        found = await _find_relevant(q, want=MAX_PER_QUERY, seen_urls=seen_urls, pool_size=6,
+                                      content_type="paper")
         paper_items.extend(found)
 
     lines = ["⚓️ 해사법 아침 브리핑\n"]
