@@ -85,7 +85,7 @@ async def handle_llm_response(
         messages = await assemble_context(
             sys_prompt=get_sys_prompt(),
             user_text=user_text,
-            history=history,
+            history=history.get_history_for_llm(),
             wiki=wiki,
             memory=memory,
             config=config,

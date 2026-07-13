@@ -158,7 +158,7 @@ def _block_wiki(wiki_obj, user_text: str) -> dict | None:
 
 # ── 메인 조립 함수 ─────────────────────────────────────────────────────────────
 
-def assemble_context(
+async def assemble_context(
     sys_prompt: str,
     user_text: str,
     history: list,
@@ -252,18 +252,22 @@ harness_agent.py 수정 방법 (1줄):
 
 
 if __name__ == "__main__":
-    # 간단 테스트
-    msgs = assemble_context(
-        sys_prompt="You are Hermes, a personal AI assistant.",
-        user_text="오늘 날씨 어때요? 그리고 하네스 상태 알려줘",
-        history=[
-            {"role": "user", "content": "안녕"},
-            {"role": "assistant", "content": "안녕하세요!"},
-        ],
-    )
-    print(f"\n조립된 메시지: {len(msgs)}블록")
-    for m in msgs:
-        role = m.get("role")
-        content = m.get("content", "")[:80]
-        print(f"  [{role}] {content}...")
-    print(patch_harness_agent())
+    import asyncio
+
+    async def _test():
+        msgs = await assemble_context(
+            sys_prompt="You are Hermes, a personal AI assistant.",
+            user_text="오늘 날씨 어때요? 그리고 하네스 상태 알려줘",
+            history=[
+                {"role": "user", "content": "안녕"},
+                {"role": "assistant", "content": "안녕하세요!"},
+            ],
+        )
+        print(f"\n조립된 메시지: {len(msgs)}블록")
+        for m in msgs:
+            role = m.get("role")
+            content = m.get("content", "")[:80]
+            print(f"  [{role}] {content}...")
+        print(patch_harness_agent())
+
+    asyncio.run(_test())
