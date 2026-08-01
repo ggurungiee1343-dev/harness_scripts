@@ -1,0 +1,5 @@
+{
+  "PILOT_CODE": "MJ",
+  "AVOID_KEYWORDS": [],
+  "_설명": "AVOID_KEYWORDS에 FROM/TO(접안지·출항지 코드)에 포함되면 걸리는 키워드를 넣으세요. 예: [\"OTK\", \"YMP\"]"
+}
