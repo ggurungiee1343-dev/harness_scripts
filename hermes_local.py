@@ -39,10 +39,33 @@ from modules.core_reducer import AgentContext, SourceChannel, HermesCoreReducer,
 
 _module_cache = {}
 
+async def _load_jumbo_context() -> str:
+    """Load context injected by Jumbo CLI from JSON."""
+    import os, json
+    ctx_path = os.path.expanduser('~/.hermes/jumbo/context.json')
+    if not os.path.exists(ctx_path):
+        return ""
+    try:
+        with open(ctx_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        parts = []
+        if isinstance(data, dict):
+            mem = data.get('memory')
+            goals = data.get('goals')
+            if mem:
+                parts.append(f"Memory: {json.dumps(mem, ensure_ascii=False)}")
+            if goals:
+                parts.append(f"Goals: {json.dumps(goals, ensure_ascii=False)}")
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
 async def _reducer_llm(prompt: str) -> str:
-    """DecisionAgent용 실시간 LLM 라우터 — 현재 모드(Gemma4/DeepSeek) 반영"""
+    """DecisionAgent용 실시간 LLM 라우터 — 현재 모드(Gemma4/DeepSeek) 반영, Jumbo 컨텍스트 포함"""
+    jumbo = await _load_jumbo_context()
+    full_prompt = f"{jumbo}\n\n{prompt}" if jumbo else prompt
     from hybrid_router import router as _hr_router
-    res, name = _hr_router.send_completion(prompt)
+    res, name = _hr_router.send_completion(full_prompt)
     return res
 
 _core_reducer = HermesCoreReducer(llm=_reducer_llm)
@@ -583,6 +606,28 @@ async def cmd_jumbo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         mod_meta = load_script('update_meta')
         res = mod_meta.update_meta()
         await _reply(res)
+    elif sub == 'show':
+        # Display current JSON context file
+        ctx_path = os.path.expanduser('~/.hermes/jumbo/context.json')
+        if not os.path.exists(ctx_path):
+            await _reply('현재 Jumbo 컨텍스트 파일이 없습니다.')
+        else:
+            try:
+                import json
+                with open(ctx_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                await _reply('현재 컨텍스트:\n' + json.dumps(data, ensure_ascii=False, indent=2))
+            except Exception as e:
+                await _reply(f'컨텍스트 로드 오류: {e}')
+    elif sub == 'clear':
+        ctx_path = os.path.expanduser('~/.hermes/jumbo/context.json')
+        try:
+            os.remove(ctx_path)
+            await _reply('Jumbo 컨텍스트 파일이 삭제되었습니다.')
+        except FileNotFoundError:
+            await _reply('삭제할 컨텍스트 파일이 존재하지 않습니다.')
+        except Exception as e:
+            await _reply(f'컨텍스트 삭제 오류: {e}')
     else:
         await _reply('알 수 없는 subcommand.')
 
