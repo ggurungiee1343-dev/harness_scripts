@@ -530,16 +530,44 @@ async def _handle_mjstock_chart(query, ticker: str, screener_key: str, date_str:
     pass_cnt  = sum(1 for _, v in bool_items if v)
     total_cnt = len(bool_items)
     cond_lines = [f"{'✅' if v else '❌'} {k}" for k, v in bool_items[:12]]
+    market = "kr" if screener_key.endswith("_kr") else "us"
+
+    # 2026-08-28: 매수타점 등급(A~D) 표시 신설. §4-2에서 score는 실현수익 상관
+    # +0.062(난수 수준)로 확인돼 등급이 공식 지표로 채택됐으나, 이 화면(가족이 보는
+    # 상세 조회 화면)은 여태 배선이 안 돼 있었다 — scan_single.py 쪽에서 함께 배선함.
+    # US는 2026-08-28 등급이 폐기돼 entry_grade가 항상 빈 문자열로 온다 — 정상.
+    grade = str(res.get("entry_grade") or "")
+    grade_lines = []
+    if grade:
+        overlap = res.get("entry_overlap")
+        kind    = res.get("entry_kind") or ""
+        reason  = res.get("entry_reason") or ""
+        exp10   = res.get("entry_exp_fwd10")
+        winrate = res.get("entry_exp_winrate")
+        gauge = ""
+        if isinstance(overlap, (int, float)) and market == "kr":
+            n = int(overlap)
+            gauge = "  " + "●" * n + "○" * (4 - n) + f" {n}/4"
+        grade_lines = [f"📌 매수타점  <b>{grade}급</b>{gauge}"]
+        if kind:
+            grade_lines.append(f"타점: {kind}")
+        if reason:
+            grade_lines.append(reason)
+        if isinstance(exp10, (int, float)) and isinstance(winrate, (int, float)):
+            grade_lines.append(f"실측기대: 10일 {exp10:+.1f}% / 승률 {winrate:.0f}%")
+        grade_lines.append("")
+    elif market == "us":
+        grade_lines = ["⚠️ US 매수타점 등급은 실측 결과 근거 부족으로 2026-08-28 중단됨", ""]
 
     lines = [
         f"📊 <b>{ticker}</b>  [{screener_key}]",
         f"",
-        f"점수: <b>{score:.0f}점</b>  [{bar}]",
+    ] + grade_lines + [
+        f"점수: {score:.0f}점  [{bar}]  <i>(참고용 — 등급을 우선 볼 것)</i>",
         f"조건: {pass_cnt}/{total_cnt} 통과",
         f"",
     ] + cond_lines
 
-    market = "kr" if screener_key.endswith("_kr") else "us"
     if date_str:
         screener_display = _MJSTOCK_SCREENER_NAMES.get(screener_key, screener_key)
         back_label = f"← {screener_display} 목록으로"
