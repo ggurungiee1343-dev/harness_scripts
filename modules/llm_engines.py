@@ -128,15 +128,19 @@ def _cb_record_success(engine_key: str):
 
 # ── 개별 엔진 호출 ─────────────────────────────────────────
 async def _call_nvidia(messages):
-    """GPT OSS 120B (NVIDIA API) 직접 호출"""
+    """GPT OSS 20B (NVIDIA API) 직접 호출
+    2026-09-22: 기존 openai/gpt-oss-120b가 2026-09-03 NVIDIA 측에서 end-of-life(HTTP 410
+    Gone)되어 모든 호출이 조용히 실패 → maritime_digest.py의 관련도 평가가 전부 0점 처리되며
+    3일간 빈 브리핑만 발송된 원인이었음. nvidia_client.models.list()로 실측 확인한 결과
+    120b 후속 모델은 없고 openai/gpt-oss-20b만 동일 계열로 존재(응답 포맷 동일 확인 완료)."""
     loop = asyncio.get_running_loop()
     if not nvidia_client:
         raise Exception("NVIDIA 클라이언트 미초기화")
-    print("🚀 [Engine] GPT OSS 120B (NVIDIA) 호출 중...")
+    print("🚀 [Engine] GPT OSS 20B (NVIDIA) 호출 중...")
     response = await asyncio.wait_for(loop.run_in_executor(None, lambda: nvidia_client.chat.completions.create(
-        model="openai/gpt-oss-120b", messages=messages, temperature=0.7, max_tokens=2000
+        model="openai/gpt-oss-20b", messages=messages, temperature=0.7, max_tokens=2000
     )), timeout=60)
-    return response.choices[0].message.content, "GPT OSS 120B"
+    return response.choices[0].message.content, "GPT OSS 20B"
 
 
 async def _call_local(messages):

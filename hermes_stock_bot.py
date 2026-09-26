@@ -54,7 +54,10 @@ _SYSTEM_PROMPT = (
 
 
 def _call_gpt_oss(chat_id: int, prompt: str) -> str:
-    """NVIDIA gpt-oss-120b 동기 호출 (executor에서 실행)"""
+    """NVIDIA gpt-oss-20b 동기 호출 (executor에서 실행)
+    2026-09-22: gpt-oss-120b가 2026-09-03 NVIDIA 측 end-of-life(HTTP 410)되어 형제 버그
+    (modules/llm_engines.py _call_nvidia, maritime_digest.py 발송 중단)와 동일 원인으로
+    같이 교체함."""
     if not _nvidia_client:
         return '⚠️ NVIDIA_GPT_API_KEY가 설정되지 않았습니다.'
     hist = _history.get(chat_id, [])
@@ -63,7 +66,7 @@ def _call_gpt_oss(chat_id: int, prompt: str) -> str:
     ]
     try:
         resp = _nvidia_client.chat.completions.create(
-            model='openai/gpt-oss-120b',
+            model='openai/gpt-oss-20b',
             messages=messages,
             temperature=0.7,
             max_tokens=2048,  # 추론 토큰 여유 확보 (적으면 content 빈값)
@@ -116,6 +119,7 @@ HELP_TEXT = (
     '<b>종목 분석:</b>\n'
     '• <code>/stock TICKER</code> — 개별 종목 분석\n'
     '• <code>/mjstock TICKER</code> — 상세 퀀트 분석\n'
+    '• <code>/chart TICKER</code> — 시그널선 차트 사진 (상위10개 밖 종목 개별조회)\n'
     '• <code>/mjstock nas</code> — 나스닥 상위500 일괄 스캔(세력주농사·초우량주 제외)\n'
     '• <code>/mjstock kos</code> — 코스피 상위500 일괄 스캔(세력주농사·초우량주 제외)\n\n'
     '<b>관심종목:</b>\n'
@@ -137,6 +141,57 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_user(update):
         return
     await update.message.reply_text(HELP_TEXT, parse_mode='HTML')
+
+
+_CHART_DIR = Path('/Users/bluesea/Applications/Mjstock/독자전략/us/charts')
+_MJSTOCK_PY = '/Users/bluesea/Applications/Mjstock/.venv/bin/python'
+
+
+async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chart TICKER [규칙ID] — 요청한 종목의 시그널 차트를 그려 사진으로 보낸다.
+    매일 상위 10개만 자동 발송하므로, 그 밖의 종목은 이 명령어로 개별 조회한다."""
+    if not await check_user(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            '사용법: <code>/chart TICKER</code>\n예) <code>/chart HWM</code>\n'
+            '규칙 지정: <code>/chart HWM B_초우량주_반등선-8</code>', parse_mode='HTML')
+        return
+    ticker = args[0].upper().strip()
+    rule = args[1] if len(args) > 1 else None
+
+    msg = await update.message.reply_text(f'{ticker} 차트 생성 중...')
+    cmd = [_MJSTOCK_PY, str(_CHART_DIR / 'make_signal_chart.py'), ticker, '--png']
+    if rule:
+        cmd += ['--rule', rule]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=str(_CHART_DIR),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=180)
+    except asyncio.TimeoutError:
+        await msg.edit_text(f'{ticker} 차트 생성 시간 초과(180초)')
+        return
+    except Exception as e:
+        await msg.edit_text(f'{ticker} 차트 생성 실패: {str(e)[:200]}')
+        return
+
+    stdout = out.decode('utf-8', 'replace')
+    png_path = None
+    for line in stdout.splitlines():
+        if line.startswith('[OK]') and 'PNG=' in line:
+            png_path = line.split('PNG=')[-1].strip()
+    if not png_path or not os.path.exists(png_path):
+        detail = (stdout or err.decode('utf-8', 'replace'))[-400:]
+        await msg.edit_text(f'{ticker} 차트를 만들지 못했습니다.\n<pre>{detail}</pre>',
+                            parse_mode='HTML')
+        return
+
+    caption = f'{ticker}' + (f' | {rule}' if rule else '')
+    with open(png_path, 'rb') as f:
+        await update.message.reply_photo(photo=f, caption=caption)
+    await msg.delete()
 
 
 def _load_stock_handlers():
@@ -164,6 +219,7 @@ def main():
     app.add_handler(CommandHandler('mjstock',   cmd_mjstock))
     app.add_handler(CommandHandler('coin',      cmd_coin))
     app.add_handler(CommandHandler('quant',     cmd_quant))
+    app.add_handler(CommandHandler('chart',     cmd_chart))
     # 인라인 버튼 콜백: 아침/장중 스캔 [결과 보기] 버튼 (더 구체적 패턴 — 반드시 mjstock[_:] 앞에)
     app.add_handler(CallbackQueryHandler(callback_mjstock_results, pattern=r'^mjstock_results__'))
     # 인라인 버튼 콜백: mjstock 분석 결과 버튼
