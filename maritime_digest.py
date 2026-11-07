@@ -34,7 +34,9 @@ import requests
 from dotenv import load_dotenv
 from duckduckgo_search import DDGS
 
-from modules.llm_engines import _call_nvidia
+from modules.llm_engines import _call_nvidia, _call_deepseek
+
+LLM_FAILURES: list[str] = []  # 관련도 평가 LLM 전부 실패한 건의 오류 기록(빈 브리핑 원인 구분용)
 
 load_dotenv(str(Path.home() / ".hermes" / ".env"))
 
@@ -235,8 +237,21 @@ async def _evaluate(title: str, body: str, url: str, content_type: str = "news")
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": f"제목: {title}\n본문 발췌: {body[:800]}\n출처: {url}"},
     ]
+    # 2026-11-07, MJ님 지시: DeepSeek 우선. 11-01부터 NVIDIA gpt-oss-20b가 응답 없이 타임아웃되어
+    # 전 기사 0점 → 빈 브리핑 발송. 순서: DeepSeek → NVIDIA. 로컬 Qwen은 MJ님이 사용 금지(2026-11-07) — 폴백에 넣지 말 것. 전부 실패 시 LLM_FAILURES 기록.
     try:
-        content, _ = await _call_nvidia(messages)
+        content = None
+        errs = []
+        for name, fn in (("DeepSeek", _call_deepseek), ("NVIDIA", _call_nvidia)):
+            try:
+                content, _ = await asyncio.wait_for(fn(messages), 90)
+                if content and content.strip():
+                    break
+            except Exception as e:
+                errs.append(f"{name}: {type(e).__name__} {str(e)[:80]}")
+        if not content:
+            LLM_FAILURES.append(" / ".join(errs))
+            raise Exception("모든 LLM 호출 실패")
         content = content.strip()
         score = 0
         summary = content
@@ -366,7 +381,9 @@ async def build_digest() -> str:
             href = r.get("href", "")
             lines.append(f"{i}. {title}\n{summary}\n{href}\n")
 
-    if not news_items and not paper_items and not law_items:
+    if LLM_FAILURES:
+        lines.append(f"⚠️ 관련도 평가 AI 호출 실패 {len(LLM_FAILURES)}건 — 결과가 적거나 없으면 이 때문일 수 있음.\n예: {LLM_FAILURES[0][:200]}")
+    if not news_items and not paper_items and not law_items and not LLM_FAILURES:
         lines.append("오늘은 관련도 기준(RELEVANCE≥6)을 통과한 결과를 찾지 못했습니다 — 쿼리 재확인 필요.")
 
     return "\n".join(lines)
@@ -393,7 +410,36 @@ def send_telegram(text: str):
             print(f"[ERROR] 텔레그램 발송 실패: {resp.status_code} {resp.text[:200]}")
 
 
+def collect_candidates() -> list[dict]:
+    """2026-11-07 A안: Claude 예약작업용. LLM 평가 없이 후보만 수집(평가는 Claude가 직접)."""
+    out, seen = [], set()
+
+    def add(items, ctype):
+        for r in items:
+            href = r.get("href", "")
+            if href and href not in seen:
+                seen.add(href)
+                out.append({"type": ctype, "source": r.get("source", ""), "title": r.get("title", ""),
+                            "body": (r.get("body", "") or "")[:600], "href": href})
+
+    for name, feed_url in FIXED_RSS_SOURCES:
+        add(_fetch_rss(name, feed_url), "news")
+    for qs, ctype in ((NEWS_QUERIES, "news"), (PAPER_QUERIES, "paper"), (LAW_QUERIES, "law")):
+        for q in qs:
+            add(_search(q, max_results=6), ctype)
+    return out
+
+
 def main():
+    import json
+    if len(sys.argv) >= 3 and sys.argv[1] == "--collect":
+        Path(sys.argv[2]).write_text(json.dumps(collect_candidates(), ensure_ascii=False, indent=1))
+        print(f"후보 저장: {sys.argv[2]}")
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] == "--send":
+        send_telegram(Path(sys.argv[2]).read_text())
+        print("발송 완료")
+        return
     digest = asyncio.run(build_digest())
     print(digest)
     send_telegram(digest)
